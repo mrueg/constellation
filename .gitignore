@@ -1,0 +1,12 @@
+# Build output
+/constellation
+/dist/
+
+# Plans and indexes produced by running the tool
+/constellation-plan.json
+/plan.json
+/*.md.plan
+
+# Frames extracted while checking the demo recording
+/demo/*.png
+/completions/

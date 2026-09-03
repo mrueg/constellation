@@ -1,0 +1,76 @@
+version: 2
+
+project_name: constellation
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+    # Generate shell completions from the command tree so the archive ships
+    # them without a second copy to maintain.
+    - mkdir -p completions
+    - sh -c 'go run . completion bash > completions/constellation.bash'
+    - sh -c 'go run . completion zsh  > completions/_constellation'
+    - sh -c 'go run . completion fish > completions/constellation.fish' 
+
+builds:
+  - id: constellation
+    main: .
+    binary: constellation
+    # The whole program is pure Go, so the binaries stay static and portable.
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: constellation
+    formats: [tar.gz]
+    files:
+      - README.md
+      - LICENSE*
+      - src: completions/*
+        dst: completions
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  footer: |
+    Planning uses the GitHub REST API; star lists are read and written through
+    the GraphQL API, which needs a token carrying the `user` scope
+    (`gh auth refresh -s user`). See the README before running
+    `constellation apply`.

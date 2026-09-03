@@ -1,0 +1,42 @@
+version: "2"
+
+linters:
+  enable:
+    # File permissions and credential handling: the tool writes a star cache
+    # and a plan, and holds a GitHub token.
+    - gosec
+    # The program is full of HTTP responses that must be closed.
+    - bodyclose
+    - errorlint
+    - misspell
+    - unconvert
+    - usestdlibvars
+
+  settings:
+    gosec:
+      excludes:
+        # Opening a path the user supplied is what --out, --cache and --plan
+        # are for; there is no untrusted input here.
+        - G304
+        # The randomness seeds k-means restarts and the SVD sketch. It is
+        # deliberately reproducible, which is the opposite of what a
+        # cryptographic generator provides.
+        - G404
+    errcheck:
+      # Terminal and report output: a failed write to stdout is not something a
+      # CLI can act on, and a deferred Close on a response body is idiomatic.
+      # Writes that go to a file are checked explicitly at Flush instead.
+      exclude-functions:
+        - (io.Closer).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+  exclusions:
+    rules:
+      # Table-driven tests read better without a closed error check on every
+      # helper, and unclosed bodies in tests are not a leak that matters.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
