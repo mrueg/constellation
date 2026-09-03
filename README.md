@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <img src="demo/constellation.gif" alt="constellation grouping 4,169 stars into 32 lists, then filing them into GitHub star lists" width="900">
+  <img src="demo/constellation.gif" alt="constellation grouping 4,169 stars into 31 lists, then filing them into GitHub star lists" width="900">
 </p>
 
 ```sh
@@ -33,35 +33,14 @@ with `apply` in `--dry-run` mode.
 
 Planning never touches your account.
 
-## How it talks to GitHub
-
-Stars are read through the REST API. Star lists are read and written through
-the GraphQL API — `viewer.lists` to read, and `createUserList`,
-`updateUserList`, `deleteUserList` and `updateUserListsForItem` to write.
-Everything is a documented endpoint; nothing scrapes a page.
-
-This was not always possible. Star lists had no API of any kind for years
-([cli/cli#13226](https://github.com/cli/cli/issues/13226),
-[community#8293](https://github.com/orgs/community/discussions/8293)), and an
-earlier version of this tool replayed the web UI's HTML forms with a browser
-session cookie. That meant guessing list slugs, scraping membership out of
-markup, treating an undocumented "406 with an empty body" as success, and
-asking you for a credential that is a full login to your account. All of that
-is gone.
-
 ## Install
 
 ```sh
 go install github.com/mrueg/constellation@latest
 ```
 
-Dependencies are [google/go-github](https://github.com/google/go-github) for
-the REST API, [urfave/cli](https://github.com/urfave/cli) for the command line,
-[gonum](https://gonum.org) for the matrix factorization,
-[kljensen/snowball](https://github.com/kljensen/snowball) for stemming, and
-[fatih/color](https://github.com/fatih/color) with
-[go-runewidth](https://github.com/mattn/go-runewidth) for terminal output.
-Nothing is downloaded at runtime — the model runs entirely in-process.
+Or take a binary from the [releases](https://github.com/mrueg/constellation/releases)
+page, built for linux and macOS on amd64 and arm64.
 
 ## Credentials
 
@@ -135,44 +114,23 @@ turning this on put 738 repositories into a second list and lowered
 within-list topic agreement from 0.049 to 0.044. Second-choice placements are
 weaker fits by definition — this buys coverage, not purity.
 
-## Package dependencies: tried, measured, removed
-
-Reading each repository's package manifest — `go.mod`, `package.json`,
-`Cargo.toml` — and treating each package as evidence was implemented and
-measured on a 4,169-star account. It was fast (about two minutes, off the CDN,
-no API quota) and the signal is genuinely there in isolation: repositories
-sharing more than a fifth of their dependencies have 7.8 times the topic
-overlap of repositories sharing none.
-
-It still **measured no better than leaving it out** — 0.0544 against 0.0537 for
-topic agreement, well inside the noise band. Whatever dependencies knew, the
-topics and descriptions already knew. The code is gone rather than switched
-off, because an unused code path is a maintenance cost that pays nothing.
-
-Two findings from it are worth keeping. Dependencies need their own vocabulary
-budget: a few thousand repositories yield around eighteen thousand distinct
-packages, nearly all rare, and since vocabulary is chosen by highest inverse
-document frequency, sharing one pool let them evict every descriptive word and
-cost nine tenths of the clustering quality. And GitHub's dependency-graph SBOM
-endpoint is the wrong door — generating an SBOM is expensive server-side, so it
-burns a CPU-seconds budget that no authentication raises, sustaining about
-sixteen repositories a minute before collapsing into minute-long penalties.
-
 ## Tuning the categories
 
 > **The measured figures in this section predate two model fixes** — term
 > weights below one used to come out negative, and the dendrogram was cut in
 > the order merges were produced rather than by height. Both changed the
-> output: the same defaults now place 3,663 of 4,169 stars where they placed
-> 2,993. Treat the numbers below as directional until they are re-measured.
+> output, as did a later fix to keep centroids describing their members: the
+> same defaults now place 3,369 of 4,169 stars where they placed 2,993. Treat
+> the numbers below as directional until they are re-measured.
 
 
 The defaults aim at lists you would plausibly have made by hand.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `--clusters N` | `0` | Fixes the number of categories. `0` picks it by silhouette score. |
-| `--min-clusters` / `--max-clusters` | `6` / `32` | The range searched when picking automatically. |
+| `--algorithm` | `agglomerative` | Ward agglomerative clustering, or `kmeans`. Several flags below apply only to one of them. |
+| `--clusters N` | `0` | Fixes the number of categories. `0` cuts the dendrogram at `--max-clusters`; under `kmeans` it searches by silhouette score. |
+| `--min-clusters` / `--max-clusters` | `6` / `32` | `--max-clusters` is where the tree is cut. `--min-clusters` applies to `kmeans` only. |
 | `--min-size N` | `4` | Dissolves categories smaller than this. A three-repo list is not a category. |
 | `--max-lists N` | `32` | Keeps only the N largest categories. See the cap below. |
 | `--lsa-dims N` | `150` | Latent dimensions kept by the factorization. |
@@ -183,8 +141,32 @@ The defaults aim at lists you would plausibly have made by hand.
 | `--multi-list N` | `1` | Most lists one repository may join. |
 | `--outlier-sigmas F` | `3` | How readily a repository is left uncategorized. `0` forces everything into a list. |
 | `--min-similarity F` | `0.05` | Absolute floor on fit, under the outlier test. |
-| `--seed N` | `1` | Same seed, same categories. |
+| `--seed N` | `1` | Random seed for `--algorithm kmeans`. The default clustering ignores it. |
+| `--lsa-seed N` | `1` | Seeds the randomized factorization. This one the default path does use — see above. |
+| `--lsa-oversample N` | `0` | Extra columns in the random sketch; `0` scales with `--lsa-dims`. Wider is steadier and slower. |
+| `--lsa-power N` | `4` | Power iterations in the SVD. More is slower and sharper. |
+| `--topic-weight F` | `3` | How much a repository's own topics count. The strongest single signal. |
+| `--topic-word-weight F` | `1.2` | How much the individual words of a topic count, on top of the whole topic. |
+| `--topic-inferred-weight F` | `0.5` | How much topics *guessed* from a name or description count, against real ones. |
+| `--topic-min-count N` | `3` | How often a topic must appear before it can be inferred elsewhere. |
+| `--readme-weight F` | `0.15` | How much a README word counts. Raising it measured worse; see above. |
+| `--readme-words N` | `120` | Words kept from each README. |
+| `--readme-bytes N` | `4096` | Bytes read from each README before truncation. |
+| `--readme-workers N` | `8` | Concurrent README fetches. |
+| `--min-df N` / `--max-df F` | `2` / `0.4` | Ignore terms rarer or more common than this. |
+| `--max-vocab N` | `12000` | Cap on vocabulary size. `0` lifts it — needed with `--min-df 1`. |
+| `--weighting` | `tfidf` | `tfidf` or `bm25`, with `--bm25-k1` and `--bm25-b`. |
+| `--merge-duplicates F` | `0.3` | Merge two categories sharing this fraction of their top terms. |
+| `--min-name-coverage F` | `0.15` | Drop a category whose name describes too few of its members. |
+| `--split-max-size N` / `--split-min-size N` | `200` / `40` | When an oversized category is split, and how small the pieces may be. |
+| `--rescue-neighbours N` | `10` | Neighbours polled when placing a repository no category claimed. |
+| `--rescue-agreement F` | `0.8` | How many of them must agree before it is placed. |
 | `--verbose`, `-v` | | Prints every repository rather than five per category. |
+| `--show N` | `0` | Print only the first N categories. The plan file always holds every one. |
+
+`--out` and `--plan` set where the plan is written and read, `--only` restricts
+an apply to named categories, and `plan --apply` runs both halves in one go.
+`--restarts` and `--silhouette-sample` tune `--algorithm kmeans` only.
 
 **The detected language is not counted as evidence.** Every repository written
 in Go shares one identical term, which makes it far too strong a grouper: it
@@ -196,19 +178,22 @@ as a topic still counts at topic weight — that is a deliberate label rather
 than a detection. `--language-weight 1.5` restores the old behaviour if you
 would rather have language-shaped lists.
 
-**Roughly half the categories are reproducible, and that is a property of
-your stars rather than a bug.** Re-running with a different `--seed` keeps
-about half the category names and exchanges around a quarter of the members of
-those it keeps. `--consensus N` clusters the agreement between N runs instead
-of trusting one; measured across three seeds it halved the run-to-run spread of
-the quality metric, from 0.0059 to 0.0035, but left name stability exactly
-where it was at 49%, for five times the runtime. That is worth knowing: if the
-instability were merely a bad starting point, averaging over starting points
-would fix it. It does not, which means there is no single preferred way to
-divide these repositories into thirty groups — several roughly equally good
-divisions exist and the seed picks between them. Read the result as one
-reasonable cut, not as the cut. `--consensus` is off by default and earns its
-cost only when a reproducible number matters more than a quick one.
+**A fixed seed always reproduces its own answer — but the seed matters more
+than any other flag.** The clustering itself has no random element, so the same
+stars and the same flags give byte-identical output. What is seeded is the
+randomized SVD underneath it, and its `--lsa-seed` moves the result further
+than any documented knob. Before the sketch was widened, three seeds placed
+3663, 3398 and 3112 of the same 4169 stars; they now place 3284, 3543 and 3477.
+
+That is partly under-convergence, since a randomized factorization is only an
+approximation and the sketch was too narrow for 150 dimensions. Widening it
+(now `--lsa-dims / 2`, adjustable with `--lsa-oversample`) roughly halved the
+spread. The rest is a property of the stars: several roughly equally good ways
+to divide them into thirty groups exist, and the seed picks between them. Read
+the result as one reasonable cut, not as the cut.
+
+`--consensus N` clusters the agreement between N runs rather than trusting one,
+at N times the cost, and applies only under `--algorithm kmeans`.
 
 **The defaults were chosen by measurement, not taste**, and a single run is not
 a measurement — the metric moves by 0.006 between seeds with nothing else
@@ -296,6 +281,12 @@ without reconciling — it deletes lists this tool created that the plan no
 longer contains, smallest first, and only as many as are needed to fit. Neither
 ever touches a list you made yourself.
 
+`--batch N` (default 25) puts several membership changes in one request.
+GraphQL runs them serially, so the outcome is identical to sending them one at
+a time — but GitHub's limits are on requests, which is what decides how long a
+large apply takes. A request GitHub judges too complex is split and retried, so
+the number is a target rather than a limit.
+
 `--dry-run` reports what would happen and writes nothing. It is the only way to
 preview `--reconcile`, which deletes lists: `--limit` does not help there,
 because reconciling runs in full before any limit applies to the additions.
@@ -345,52 +336,6 @@ touched, and the repositories stay starred — only the grouping goes.
 | `--continue` | `apply` | Keep going when one repository fails instead of stopping. |
 | `--include-forks`, `--include-archived` | `plan` | Include stars that are otherwise filtered out; the run reports how many it skipped. |
 | `--cache`, `--cache-ttl`, `--refresh` | `plan` | The star cache lives under your user cache directory (`stars.json`), is reused for 24 hours, and `--refresh` ignores it. |
-
-## Shell completion
-
-Release archives ship completion scripts (`completions/`), generated from the
-command tree so they never drift from the flags. To produce one from a source
-checkout:
-
-```sh
-constellation completion zsh > _constellation  # also: bash, fish, pwsh
-```
-
-## The demo recording
-
-`demo/demo.tape` is a [vhs](https://github.com/charmbracelet/vhs) script; the
-GIF above is its output. To re-record:
-
-```sh
-vhs demo/demo.tape
-```
-
-`apply` runs with `--dry-run` there deliberately: a recording should neither
-depend on nor cause changes to a real account.
-
-## Development
-
-```sh
-go test ./...
-```
-
-The tests cover tokenization and stemming, the randomized SVD pinned against an
-exact dense SVD of the same matrix, the HTML form parser against captured
-GitHub markup, the clustering end-to-end on a synthetic corpus with planted
-groups —
-including that the two repositories belonging to no group are left
-uncategorized rather than forced into one — and `apply` against a stub GitHub,
-covering list creation, idempotent re-runs, and the case that matters most: a
-repository already in a hand-curated list keeps that membership.
-
-Stars are read with [google/go-github](https://github.com/google/go-github).
-Lists go through GraphQL, where one query returns every list and a second pages
-its contents — the two are split because asking for fifty lists by a hundred
-items at once exceeds GitHub's query cost limit and comes back as a 502.
-
-Writes are paced (`--delay`, default 1s, which is GitHub's documented minimum
-between mutating requests) and back off on the `Retry-After` GitHub sends when
-it wants a slower pace.
 
 ## License
 
