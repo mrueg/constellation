@@ -29,45 +29,57 @@ func Soften(sp *embed.Space, r *Result, ratio float64, maxLists int) *Result {
 	if len(r.Also) != len(r.Assign) {
 		r.Also = make([][]int, len(r.Assign))
 	}
-	for i, row := range sp.Rows {
-		primary := r.Assign[i]
-		if primary < 0 {
-			r.Also[i] = nil
-			continue
-		}
-		floor := ratio * row.Dot(r.Centroids[primary])
-		if floor <= 0 {
-			r.Also[i] = nil
-			continue
-		}
-		type cand struct {
-			c   int
-			sim float64
-		}
-		var also []cand
-		for c := range r.Centroids {
-			if c == primary {
-				continue
-			}
-			if sim := row.Dot(r.Centroids[c]); sim >= floor {
-				also = append(also, cand{c, sim})
-			}
-		}
-		// Best fit first, so that the cap keeps the memberships worth keeping.
-		for a := range also {
-			for b := a + 1; b < len(also); b++ {
-				if also[b].sim > also[a].sim {
-					also[a], also[b] = also[b], also[a]
-				}
-			}
-		}
-		if len(also) > maxLists-1 {
-			also = also[:maxLists-1]
-		}
-		r.Also[i] = nil
-		for _, c := range also {
-			r.Also[i] = append(r.Also[i], c.c)
-		}
+	for i := range sp.Rows {
+		softenOne(sp, r, i, ratio, maxLists)
 	}
 	return r
+}
+
+// softenOne is Soften for a single repository. Placing a newcomer into
+// categories that already exist needs exactly this and nothing else: the
+// repositories around it were softened when their plan was made, and redoing
+// them would move lists that have already been reviewed.
+func softenOne(sp *embed.Space, r *Result, i int, ratio float64, maxLists int) {
+	if maxLists <= 1 || ratio <= 0 || i >= len(r.Also) {
+		return
+	}
+	row := sp.Rows[i]
+	primary := r.Assign[i]
+	if primary < 0 {
+		r.Also[i] = nil
+		return
+	}
+	floor := ratio * row.Dot(r.Centroids[primary])
+	if floor <= 0 {
+		r.Also[i] = nil
+		return
+	}
+	type cand struct {
+		c   int
+		sim float64
+	}
+	var also []cand
+	for c := range r.Centroids {
+		if c == primary {
+			continue
+		}
+		if sim := row.Dot(r.Centroids[c]); sim >= floor {
+			also = append(also, cand{c, sim})
+		}
+	}
+	// Best fit first, so that the cap keeps the memberships worth keeping.
+	for a := range also {
+		for b := a + 1; b < len(also); b++ {
+			if also[b].sim > also[a].sim {
+				also[a], also[b] = also[b], also[a]
+			}
+		}
+	}
+	if len(also) > maxLists-1 {
+		also = also[:maxLists-1]
+	}
+	r.Also[i] = nil
+	for _, c := range also {
+		r.Also[i] = append(r.Also[i], c.c)
+	}
 }

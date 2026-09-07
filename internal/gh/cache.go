@@ -46,7 +46,9 @@ func SaveCache(path, user string, repos []Repo) error {
 }
 
 // LoadCache returns cached stars for the user when they are younger than
-// maxAge. A miss is reported as (nil, zero time, nil) rather than an error.
+// maxAge; a maxAge of zero or less accepts the cache at any age, which is what
+// an incremental refresh reads it with. A miss is reported as
+// (nil, zero time, nil) rather than an error.
 func LoadCache(path, user string, maxAge time.Duration) ([]Repo, time.Time, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -59,7 +61,7 @@ func LoadCache(path, user string, maxAge time.Duration) ([]Repo, time.Time, erro
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, time.Time{}, nil // a corrupt cache is a miss, not a failure
 	}
-	if c.User != user || time.Since(c.FetchedAt) > maxAge {
+	if c.User != user || (maxAge > 0 && time.Since(c.FetchedAt) > maxAge) {
 		return nil, c.FetchedAt, nil
 	}
 	return c.Repos, c.FetchedAt, nil

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mrueg/constellation/internal/gh"
+	"github.com/mrueg/constellation/internal/plan"
 	"github.com/mrueg/constellation/internal/textproc"
 	"github.com/urfave/cli/v3"
 )
@@ -373,5 +374,93 @@ func TestUnreadableReadmesAreCached(t *testing.T) {
 	cache := gh.ReadmeCache{}
 	if changed := harvestReadmes(cache, repos, time.Now()); changed != 2 {
 		t.Errorf("harvested %d entries, want both failures recorded", changed)
+	}
+}
+
+// placements maps a repository to the categories it is filed under.
+func placements(p *plan.Plan) map[string][]string {
+	out := map[string][]string{}
+	for _, c := range p.Categories {
+		for _, r := range c.Repos {
+			out[r.FullName] = append(out[r.FullName], c.Name)
+		}
+	}
+	return out
+}
+
+// An incremental run files the new stars and changes nothing else. Re-running
+// the whole model to place a handful of new repositories moves ones that were
+// reviewed and applied weeks ago, because the categories are one reasonable
+// cut of several and the cut moves when the corpus does.
+func TestExtendPlanOnlyPlacesTheNewStars(t *testing.T) {
+	f := defaultPlanFlags(t)
+	repos := synthRepos(60)
+	first, err := buildPlan(context.Background(), nil, "octocat", repos, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Stamp(time.Now())
+
+	// synthRepos is a prefix generator, so these are the same 60 plus 6 new.
+	grown := synthRepos(66)
+	second, err := extendPlan(context.Background(), nil, "octocat", grown, f, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(second.Categories) != len(first.Categories) {
+		t.Fatalf("categories went from %d to %d; an incremental run must not add or drop any",
+			len(first.Categories), len(second.Categories))
+	}
+	for i := range first.Categories {
+		if first.Categories[i].Name != second.Categories[i].Name {
+			t.Errorf("category %d was renamed from %q to %q", i, first.Categories[i].Name, second.Categories[i].Name)
+		}
+		if first.Categories[i].Description != second.Categories[i].Description {
+			t.Errorf("category %q lost its description", first.Categories[i].Name)
+		}
+	}
+
+	before, after := placements(first), placements(second)
+	for name, was := range before {
+		if !reflect.DeepEqual(was, after[name]) {
+			t.Errorf("%s moved from %v to %v", name, was, after[name])
+		}
+	}
+
+	newcomers := 0
+	for _, r := range grown[60:] {
+		if len(after[r.FullName]) > 0 {
+			newcomers++
+		}
+	}
+	unassigned := map[string]bool{}
+	for _, r := range second.Unassigned {
+		unassigned[r.FullName] = true
+	}
+	for _, r := range grown[60:] {
+		if len(after[r.FullName]) == 0 && !unassigned[r.FullName] {
+			t.Errorf("%s was neither filed nor reported as uncategorized", r.FullName)
+		}
+	}
+	if newcomers == 0 {
+		t.Error("none of the six new repositories was filed, though they repeat the same three kinds")
+	}
+	if second.Settings["incremental"] != "true" {
+		t.Error("the plan does not record that it was extended rather than built")
+	}
+}
+
+// A plan is tied to the account it was made for: extending somebody else's
+// plan would file their categories onto this account's stars.
+func TestExtendPlanRefusesAnotherAccountsPlan(t *testing.T) {
+	f := defaultPlanFlags(t)
+	repos := synthRepos(60)
+	p, err := buildPlan(context.Background(), nil, "octocat", repos, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := extendPlan(context.Background(), nil, "someone-else", repos, f, p); err == nil {
+		t.Error("extending a plan made for another account was allowed")
 	}
 }

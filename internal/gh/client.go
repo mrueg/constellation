@@ -137,23 +137,33 @@ func (c *Client) Viewer(ctx context.Context) (string, error) {
 	return login, nil
 }
 
+// starsPerPage is the page size every star walk uses. The incremental fetch
+// depends on it, since it works out which page a cached star list ends on.
+const starsPerPage = 100
+
 // Starred fetches every repository the authenticated user has starred.
 func (c *Client) Starred(ctx context.Context) ([]Repo, error) {
+	return c.starredFrom(ctx, 1)
+}
+
+// starredFrom walks the starred list from the given page onwards.
+func (c *Client) starredFrom(ctx context.Context, from int) ([]Repo, error) {
 	// Oldest first. GitHub's default for this endpoint is newest first, and
 	// under that order a star added while the pages are being walked pushes
 	// every later item down one slot — so one repository is silently skipped,
 	// and unstarring duplicates one instead. Ascending, new stars land past
-	// the cursor and disturb nothing already read.
+	// the cursor and disturb nothing already read — and a cached prefix stays
+	// where it was, which is what makes an incremental fetch possible at all.
 	opts := &github.ActivityListStarredOptions{
 		Sort:        "created",
 		Direction:   "asc",
-		ListOptions: github.ListOptions{PerPage: 100},
+		ListOptions: github.ListOptions{PerPage: starsPerPage, Page: from},
 	}
 	var all []Repo
 	// Belt and braces: a repository seen twice would be clustered twice and
 	// filed twice.
 	seen := make(map[int64]bool)
-	for page := 1; ; page++ {
+	for page := from; ; page++ {
 		var (
 			items []*github.StarredRepository
 			resp  *github.Response
@@ -179,6 +189,53 @@ func (c *Client) Starred(ctx context.Context) ([]Repo, error) {
 		}
 		opts.Page = resp.NextPage
 	}
+}
+
+// StarredIncremental brings a cached star list up to date by re-reading only
+// its last page onwards, and reports whether that was sound.
+//
+// Stars come back oldest first, so everything already cached keeps its
+// position and new ones land at the end: reading the final page again and
+// walking on from there is enough to find them, at two requests instead of one
+// per hundred stars.
+//
+// What that assumes is that nothing was removed. Unstarring a repository
+// shifts every later one down a slot, and an unstar early in the list would
+// otherwise go unnoticed for as long as the cache lived — leaving the plan to
+// file a repository the account no longer stars. So the overlap is checked
+// rather than trusted: the page that should still hold the cached tail has to
+// hold exactly it, in order. It does not, ok is false and the caller re-reads
+// the list in full, which is the same work the old code did unconditionally.
+func (c *Client) StarredIncremental(ctx context.Context, cached []Repo) ([]Repo, bool, error) {
+	// Below a page there is nothing to save: the full walk is one request.
+	if len(cached) < starsPerPage {
+		return nil, false, nil
+	}
+	// The page the cached list ends on, so that the last cached page is read
+	// again — that overlap is what the check below is made of — and everything
+	// after it is new.
+	from := (len(cached) + starsPerPage - 1) / starsPerPage
+	offset := (from - 1) * starsPerPage
+
+	tail, err := c.starredFrom(ctx, from)
+	if err != nil {
+		return nil, false, err
+	}
+	overlap := len(cached) - offset
+	if len(tail) < overlap {
+		return nil, false, nil // stars disappeared; the prefix cannot be trusted either
+	}
+	for i, r := range cached[offset:] {
+		if tail[i].ID != r.ID {
+			return nil, false, nil
+		}
+	}
+	// The cached prefix, then everything from the overlap on as the API now
+	// reports it — so an unstar inside the tail is picked up as well.
+	merged := make([]Repo, 0, offset+len(tail))
+	merged = append(merged, cached[:offset]...)
+	merged = append(merged, tail...)
+	return merged, true, nil
 }
 
 // Readme fetches the repository's README as plain text, truncated to limit
