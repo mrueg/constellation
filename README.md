@@ -77,6 +77,14 @@ third of repositories carry no topics at all, so by default `constellation`
 also reads each README — one API call per repository, cached afterwards, so the
 cost is paid once. `--readme=false` skips it.
 
+The READMEs are cached in a file of their own, keyed by repository, and live
+for 30 days. That is deliberate: the star list goes stale in a day and is a few
+dozen cheap pages, while a README costs an API call each and thousands of them
+are what a first run actually spends its time on. Under one shared expiry,
+picking up a handful of new stars threw every README away with the star list
+and re-read the lot. `--refresh` now re-fetches only the stars;
+`--refresh-readmes` re-reads the prose.
+
 Only the opening `--readme-words` (120) are kept: a project's first paragraph
 is its own summary of itself, while the rest is installation and contribution
 boilerplate that every repository shares and that would group them by nothing.
@@ -151,7 +159,7 @@ The defaults aim at lists you would plausibly have made by hand.
 | `--topic-min-count N` | `3` | How often a topic must appear before it can be inferred elsewhere. |
 | `--readme-weight F` | `0.15` | How much a README word counts. Raising it measured worse; see above. |
 | `--readme-words N` | `120` | Words kept from each README. |
-| `--readme-bytes N` | `4096` | Bytes read from each README before truncation. |
+| `--readme-bytes N` | `8192` | Bytes read from each README before truncation. |
 | `--readme-workers N` | `8` | Concurrent README fetches. |
 | `--min-df N` / `--max-df F` | `2` / `0.4` | Ignore terms rarer or more common than this. |
 | `--max-vocab N` | `12000` | Cap on vocabulary size. `0` lifts it — needed with `--min-df 1`. |
@@ -345,6 +353,7 @@ touched, and the repositories stay starred — only the grouping goes.
 | `--continue` | `apply` | Keep going when one repository fails instead of stopping. |
 | `--include-forks`, `--include-archived` | `plan` | Include stars that are otherwise filtered out; the run reports how many it skipped. |
 | `--cache`, `--cache-ttl`, `--refresh` | `plan` | The star cache lives under your user cache directory (`stars.json`), is reused for 24 hours, and `--refresh` ignores it. |
+| `--readme-cache`, `--readme-cache-ttl`, `--refresh-readmes` | `plan` | The README cache is a separate file (`readmes.json`) with its own 30-day life, so re-fetching your stars does not re-read every README. `0` keeps them forever. |
 
 ## License
 

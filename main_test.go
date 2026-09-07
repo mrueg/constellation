@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mrueg/constellation/internal/gh"
 	"github.com/mrueg/constellation/internal/textproc"
@@ -304,5 +306,72 @@ func TestInterruptedReadmesStayUnmarked(t *testing.T) {
 		if repos[i].Readme != "" {
 			t.Errorf("%s was marked despite the run being interrupted", repos[i].FullName)
 		}
+	}
+}
+
+// countingReadmes records how many repositories were actually asked for, which
+// is the cost this cache exists to avoid.
+type countingReadmes struct {
+	calls int
+	mu    sync.Mutex
+}
+
+func (c *countingReadmes) Readme(_ context.Context, _, _ string, _ int) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return "a readme", nil
+}
+
+// Re-fetching the star list must not re-fetch every README with it. The star
+// cache expires in a day and a README costs an API call each, so holding both
+// under one expiry made picking up a handful of new stars cost thousands of
+// requests.
+func TestCachedReadmesSurviveAStarRefresh(t *testing.T) {
+	repos := []gh.Repo{{FullName: "a/one"}, {FullName: "b/two"}, {FullName: "c/three"}}
+	cache := gh.ReadmeCache{
+		"a/one": {Text: "one", FetchedAt: time.Now()},
+		"b/two": {Text: "two", FetchedAt: time.Now()},
+	}
+	applyReadmes(cache, repos)
+
+	f := &planFlags{readmeWorker: 2, readmeBytes: 1000, readmeWords: 50}
+	c := &countingReadmes{}
+	if got := fetchReadmes(context.Background(), c, repos, f); got != 1 {
+		t.Errorf("fetched %d READMEs, want the 1 that was not cached", got)
+	}
+	if c.calls != 1 {
+		t.Errorf("%d API calls, want 1: the cached READMEs were re-read", c.calls)
+	}
+	if repos[0].Readme != "one" || repos[1].Readme != "two" {
+		t.Errorf("cached text did not reach the repositories: %q, %q", repos[0].Readme, repos[1].Readme)
+	}
+
+	now := time.Now()
+	if changed := harvestReadmes(cache, repos, now); changed != 1 {
+		t.Errorf("harvested %d entries, want the 1 newly read one", changed)
+	}
+	if cache["c/three"].Text != "a readme" {
+		t.Errorf("the newly read README was not cached: %q", cache["c/three"].Text)
+	}
+	// A second run with nothing new must leave the file alone.
+	if changed := harvestReadmes(cache, repos, now); changed != 0 {
+		t.Errorf("harvested %d entries from an unchanged run, want 0", changed)
+	}
+}
+
+// A README that cannot be read is marked so that future runs stop trying, and
+// that verdict has to reach the cache even though nothing was fetched — the
+// old "save only if something was fetched" gate dropped exactly these.
+func TestUnreadableReadmesAreCached(t *testing.T) {
+	repos := []gh.Repo{{FullName: "a/one"}, {FullName: "b/two"}}
+	f := &planFlags{readmeWorker: 2, readmeBytes: 1000, readmeWords: 50}
+
+	if got := fetchReadmes(context.Background(), stubReadmes{err: errors.New("file too large")}, repos, f); got != 0 {
+		t.Fatalf("fetched %d, want 0", got)
+	}
+	cache := gh.ReadmeCache{}
+	if changed := harvestReadmes(cache, repos, time.Now()); changed != 2 {
+		t.Errorf("harvested %d entries, want both failures recorded", changed)
 	}
 }
