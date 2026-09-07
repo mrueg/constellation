@@ -236,6 +236,9 @@ type planFlags struct {
 	cachePath       string
 	cacheMaxAge     time.Duration
 	refresh         bool
+	readmeCachePath string
+	readmeMaxAge    time.Duration
+	refreshReadmes  bool
 	includeForks    bool
 	includeArchived bool
 	verbose         bool
@@ -295,7 +298,10 @@ func (f *planFlags) flags() []cli.Flag {
 
 		&cli.StringFlag{Name: "cache", Value: gh.DefaultCachePath(), Usage: "where to cache your stars", Destination: &f.cachePath},
 		&cli.DurationFlag{Name: "cache-ttl", Value: 24 * time.Hour, Usage: "how long a cached star list stays usable", Destination: &f.cacheMaxAge},
-		&cli.BoolFlag{Name: "refresh", Usage: "ignore the cache and re-fetch from the API", Destination: &f.refresh},
+		&cli.BoolFlag{Name: "refresh", Usage: "ignore the star cache and re-fetch the star list; cached READMEs are kept, see --refresh-readmes", Destination: &f.refresh},
+		&cli.StringFlag{Name: "readme-cache", Value: gh.DefaultReadmeCachePath(), Usage: "where to cache the README openings", Destination: &f.readmeCachePath},
+		&cli.DurationFlag{Name: "readme-cache-ttl", Value: 30 * 24 * time.Hour, Usage: "how long a cached README stays usable; 0 keeps it forever", Destination: &f.readmeMaxAge},
+		&cli.BoolFlag{Name: "refresh-readmes", Usage: "ignore the README cache and read every README again", Destination: &f.refreshReadmes},
 		&cli.BoolFlag{Name: "include-forks", Usage: "include starred forks", Destination: &f.includeForks},
 		&cli.BoolFlag{Name: "include-archived", Usage: "include starred archived repositories", Destination: &f.includeArchived},
 		&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}, Usage: "list every repository in every category", Destination: &f.verbose},
@@ -324,16 +330,16 @@ func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
 		return fmt.Errorf("no stars to categorize")
 	}
 	if f.withReadme {
-		if fetched := fetchReadmes(ctx, client, repos, f); fetched > 0 {
-			// The cache holds every star, including the forks and archived
-			// repositories filtered out above; writing back only the filtered
-			// set would drop them and make a later --include-forks run refetch
-			// everything. This runs even on an interrupt, so a Ctrl-C partway
-			// through does not throw away the READMEs already fetched — the
-			// next run resumes from them.
-			mergeFetched(all, repos)
-			if err := gh.SaveCache(f.cachePath, user, all); err != nil {
-				progress("could not update the cache: %v", err)
+		readmes := loadReadmes(f)
+		applyReadmes(readmes, repos)
+		fetchReadmes(ctx, client, repos, f)
+		// Saved even on an interrupt, so a Ctrl-C partway through does not
+		// throw away the READMEs already fetched, and even when every fetch
+		// failed, because a README that cannot be read is marked as such and
+		// that verdict is worth keeping too.
+		if harvestReadmes(readmes, repos, time.Now()) > 0 {
+			if err := gh.SaveReadmes(f.readmeCachePath, readmes); err != nil {
+				progress("could not update the README cache: %v", err)
 			}
 		}
 		// An interrupt during fetching means stop, not "build a plan from
@@ -740,22 +746,60 @@ func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *plan
 	return fetched
 }
 
-// mergeFetched copies fetched READMEs back onto the unfiltered star list,
-// which is what gets cached.
-func mergeFetched(all, fetched []gh.Repo) {
-	byName := make(map[string]*gh.Repo, len(fetched))
-	for i := range fetched {
-		byName[fetched[i].FullName] = &fetched[i]
+// loadReadmes reads the README cache, migrating out of the star cache the
+// first time it runs after the two were split. Failing to read it is not
+// fatal: the run re-fetches instead.
+func loadReadmes(f *planFlags) gh.ReadmeCache {
+	if f.refreshReadmes {
+		return gh.ReadmeCache{}
 	}
-	for i := range all {
-		src, ok := byName[all[i].FullName]
-		if !ok {
+	_, statErr := os.Stat(f.readmeCachePath)
+	c, err := gh.LoadReadmes(f.readmeCachePath, f.readmeMaxAge)
+	if err != nil {
+		progress("not using the README cache: %v", err)
+		c = gh.ReadmeCache{}
+	}
+	// Only when there is no README cache at all: an existing one that has
+	// simply expired must not be refilled from a star cache whose copies are
+	// older still.
+	if os.IsNotExist(statErr) {
+		if migrated := gh.ReadmesFromStarCache(f.cachePath); len(migrated) > 0 {
+			migrated.Prune(f.readmeMaxAge)
+			progress("carried %d READMEs over from the star cache", len(migrated))
+			c = migrated
+		}
+	}
+	if len(c) > 0 {
+		progress("using %d cached READMEs (--refresh-readmes to re-read them)", len(c))
+	}
+	return c
+}
+
+// applyReadmes fills in the READMEs already cached, leaving only the missing
+// ones to cost an API call.
+func applyReadmes(c gh.ReadmeCache, repos []gh.Repo) {
+	for i := range repos {
+		if e, ok := c[repos[i].FullName]; ok {
+			repos[i].Readme = e.Text
+		}
+	}
+}
+
+// harvestReadmes copies newly read READMEs into the cache and reports how many
+// entries changed, which is what decides whether the cache is worth writing.
+func harvestReadmes(c gh.ReadmeCache, repos []gh.Repo, now time.Time) int {
+	changed := 0
+	for _, r := range repos {
+		if r.Readme == "" {
 			continue
 		}
-		if src.Readme != "" {
-			all[i].Readme = src.Readme
+		if e, ok := c[r.FullName]; ok && e.Text == r.Readme {
+			continue
 		}
+		c[r.FullName] = gh.CachedReadme{Text: r.Readme, FetchedAt: now}
+		changed++
 	}
+	return changed
 }
 
 // firstWords keeps the opening n words of a text.
