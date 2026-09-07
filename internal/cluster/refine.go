@@ -360,25 +360,26 @@ func relativeFloor(med float64) float64 {
 	return med - (1-outlierRelativeGuard)*math.Abs(med)
 }
 
-func dropOutliers(sp *embed.Space, r *Result, opt RefineOptions, rejected []bool) bool {
-	if opt.MinSimilarity <= 0 && opt.OutlierSigmas <= 0 {
-		return false
-	}
-	sims := make([]float64, len(sp.Rows))
+// fitFloors is how well a repository must fit each cluster to belong to it,
+// together with every repository's fit to the cluster it is in. Refinement
+// uses it to throw members out; placing a newcomer uses it to decide whether
+// to let it in, so that a repository arriving later clears the same bar.
+func fitFloors(sp *embed.Space, r *Result, minSim, sigmas float64) (floors, sims []float64) {
+	sims = make([]float64, len(sp.Rows))
 	perCluster := make([][]float64, r.K)
 	for i, row := range sp.Rows {
 		c := r.Assign[i]
-		if c < 0 {
+		if c < 0 || c >= r.K {
 			continue
 		}
 		sims[i] = row.Dot(r.Centroids[c])
 		perCluster[c] = append(perCluster[c], sims[i])
 	}
 
-	floors := make([]float64, r.K)
+	floors = make([]float64, r.K)
 	for c := range floors {
-		floors[c] = opt.MinSimilarity
-		if opt.OutlierSigmas <= 0 || len(perCluster[c]) < 4 {
+		floors[c] = minSim
+		if sigmas <= 0 || len(perCluster[c]) < 4 {
 			continue
 		}
 		med := median(perCluster[c])
@@ -398,11 +399,19 @@ func dropOutliers(sp *embed.Space, r *Result, opt RefineOptions, rejected []bool
 		// member of it. Requiring only the first throws away good members of a
 		// category whose core happens to be very tight, where three deviations
 		// is still a hair's breadth.
-		f := math.Min(med-opt.OutlierSigmas*mad, relativeFloor(med))
+		f := math.Min(med-sigmas*mad, relativeFloor(med))
 		if f > floors[c] {
 			floors[c] = f
 		}
 	}
+	return floors, sims
+}
+
+func dropOutliers(sp *embed.Space, r *Result, opt RefineOptions, rejected []bool) bool {
+	if opt.MinSimilarity <= 0 && opt.OutlierSigmas <= 0 {
+		return false
+	}
+	floors, sims := fitFloors(sp, r, opt.MinSimilarity, opt.OutlierSigmas)
 
 	changed := false
 	for i := range sp.Rows {
