@@ -12,8 +12,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,6 +244,10 @@ type planFlags struct {
 	refreshReadmes  bool
 	includeForks    bool
 	includeArchived bool
+	minStars        int
+	starredAfter    string
+	exclude         []string
+	staleAfter      string
 	verbose         bool
 	show            int
 	apply           bool
@@ -304,6 +311,10 @@ func (f *planFlags) flags() []cli.Flag {
 		&cli.BoolFlag{Name: "refresh-readmes", Usage: "ignore the README cache and read every README again", Destination: &f.refreshReadmes},
 		&cli.BoolFlag{Name: "include-forks", Usage: "include starred forks", Destination: &f.includeForks},
 		&cli.BoolFlag{Name: "include-archived", Usage: "include starred archived repositories", Destination: &f.includeArchived},
+		&cli.IntFlag{Name: "min-stars", Usage: "ignore repositories with fewer stargazers than this", Destination: &f.minStars},
+		&cli.StringFlag{Name: "starred-after", Usage: "ignore stars added before this: a date (2024-01-01) or an age (2y, 18mo, 30d, 12h)", Destination: &f.starredAfter},
+		&cli.StringSliceFlag{Name: "exclude", Usage: "ignore repositories whose owner/name matches this glob (repeatable), e.g. --exclude 'torvalds/*'", Destination: &f.exclude},
+		&cli.StringFlag{Name: "stale-after", Usage: "report the stars with no push since this: a date (2020-01-01) or an age (2y, 18mo, 30d). Reports only; nothing is filtered", Destination: &f.staleAfter},
 		&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}, Usage: "list every repository in every category", Destination: &f.verbose},
 		&cli.IntFlag{Name: "show", Usage: "print only the first N categories (0 = all); the plan file always holds every one", Sources: cli.EnvVars(envShow), Destination: &f.show},
 		&cli.BoolFlag{Name: "apply", Usage: "apply the plan straight away instead of only writing it", Destination: &f.apply},
@@ -311,6 +322,18 @@ func (f *planFlags) flags() []cli.Flag {
 }
 
 func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
+	// Before the token is even read: a mistyped date or glob should cost a
+	// message, not a walk through every page of stars.
+	now := time.Now()
+	rf, err := f.filter(now)
+	if err != nil {
+		return err
+	}
+	stale, err := parseSince(f.staleAfter, now)
+	if err != nil {
+		return fmt.Errorf("--stale-after: %w", err)
+	}
+
 	client, err := gh.NewClient(f.token)
 	if err != nil {
 		return err
@@ -325,10 +348,11 @@ func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
 	if err != nil {
 		return err
 	}
-	repos := filterRepos(all, f)
+	repos := rf.apply(all)
 	if len(repos) == 0 {
 		return fmt.Errorf("no stars to categorize")
 	}
+	reportStale(repos, stale, os.Stdout)
 	if f.withReadme {
 		readmes := loadReadmes(f)
 		applyReadmes(readmes, repos)
@@ -630,21 +654,166 @@ func loadStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([]
 	return repos, nil
 }
 
-func filterRepos(repos []gh.Repo, f *planFlags) []gh.Repo {
+// repoFilter is the validated form of the flags that decide which stars take
+// part. It is built before anything is fetched, so a mistyped date or glob
+// costs a message rather than a walk through every page of stars.
+type repoFilter struct {
+	includeForks    bool
+	includeArchived bool
+	minStars        int
+	starredAfter    time.Time
+	exclude         []string
+}
+
+func (f *planFlags) filter(now time.Time) (*repoFilter, error) {
+	rf := &repoFilter{
+		includeForks:    f.includeForks,
+		includeArchived: f.includeArchived,
+		minStars:        f.minStars,
+		exclude:         f.exclude,
+	}
+	var err error
+	if rf.starredAfter, err = parseSince(f.starredAfter, now); err != nil {
+		return nil, fmt.Errorf("--starred-after: %w", err)
+	}
+	for _, pat := range rf.exclude {
+		// Reported here rather than at match time, where path.Match's error
+		// would be swallowed once per repository.
+		if _, err := path.Match(pat, "owner/name"); err != nil {
+			return nil, fmt.Errorf("--exclude %q: %w", pat, err)
+		}
+	}
+	return rf, nil
+}
+
+// excluded reports whether the repository matches any --exclude glob. Both
+// owner/name and the bare name are offered, so --exclude 'awesome-*' works
+// without having to write '*/awesome-*'.
+func (rf *repoFilter) excluded(r gh.Repo) bool {
+	for _, pat := range rf.exclude {
+		for _, s := range []string{r.FullName, r.Name()} {
+			if ok, err := path.Match(pat, s); err == nil && ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// apply drops the stars that are not to be categorized, and says what it
+// dropped and why. Silently working from two thirds of an account would show
+// up only as categories that make no sense.
+func (rf *repoFilter) apply(repos []gh.Repo) []gh.Repo {
+	reasons := map[string]int{}
 	out := repos[:0:0]
 	for _, r := range repos {
-		if r.Fork && !f.includeForks {
-			continue
+		switch {
+		case r.Fork && !rf.includeForks:
+			reasons["forks"]++
+		case r.Archived && !rf.includeArchived:
+			reasons["archived"]++
+		case rf.minStars > 0 && r.Stars < rf.minStars:
+			reasons["under --min-stars"]++
+		case !rf.starredAfter.IsZero() && !r.StarredAt.IsZero() && r.StarredAt.Before(rf.starredAfter):
+			reasons["starred too long ago"]++
+		case rf.excluded(r):
+			reasons["excluded"]++
+		default:
+			out = append(out, r)
 		}
-		if r.Archived && !f.includeArchived {
-			continue
-		}
-		out = append(out, r)
 	}
 	if n := len(repos) - len(out); n > 0 {
-		progress("skipped %d forked or archived stars", n)
+		parts := make([]string, 0, len(reasons))
+		for _, k := range sortedKeys(reasons) {
+			parts = append(parts, fmt.Sprintf("%d %s", reasons[k], k))
+		}
+		progress("skipped %d of %d stars: %s", n, len(repos), strings.Join(parts, ", "))
 	}
 	return out
+}
+
+func sortedKeys(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// parseSince reads a point in the past written either as a date or as an age.
+// A date is what someone reaches for once ("everything I starred since I
+// changed jobs"); an age is what a script wants, because it keeps meaning the
+// same thing tomorrow. Go's own duration syntax stops at hours, which is too
+// short a unit for a star list, so days, months and years are accepted too.
+func parseSince(s string, now time.Time) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	for _, u := range []struct {
+		suffix string
+		back   func(n int) time.Time
+	}{
+		{"mo", func(n int) time.Time { return now.AddDate(0, -n, 0) }},
+		{"y", func(n int) time.Time { return now.AddDate(-n, 0, 0) }},
+		{"d", func(n int) time.Time { return now.AddDate(0, 0, -n) }},
+	} {
+		num, ok := strings.CutSuffix(s, u.suffix)
+		if !ok {
+			continue
+		}
+		// Only a number in front makes this an age. "yesterday" ends in a "y"
+		// and is not two hundred and something years ago.
+		if n, err := strconv.Atoi(strings.TrimSpace(num)); err == nil && n >= 0 {
+			return u.back(n), nil
+		}
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		if d < 0 {
+			d = -d
+		}
+		return now.Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("%q is neither a date (2024-01-01) nor an age (2y, 18mo, 30d, 12h)", s)
+}
+
+// reportStale names the stars that have gone quiet. Nothing is filtered: a
+// dormant repository can be exactly the one worth keeping, and a tool that
+// quietly dropped a fifth of an account would be wrong more often than right.
+func reportStale(repos []gh.Repo, before time.Time, w io.Writer) int {
+	if before.IsZero() {
+		return 0
+	}
+	var stale []gh.Repo
+	for _, r := range repos {
+		if !r.PushedAt.IsZero() && r.PushedAt.Before(before) {
+			stale = append(stale, r)
+		}
+	}
+	if len(stale) == 0 {
+		return 0
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i].PushedAt.Before(stale[j].PushedAt) })
+	fmt.Fprintf(w, "\n%d of %d stars have had no push since %s:\n",
+		len(stale), len(repos), before.Format("2006-01-02"))
+	shown := stale
+	if len(shown) > 10 {
+		shown = shown[:10]
+	}
+	for _, r := range shown {
+		fmt.Fprintf(w, "      %-44s %s\n", r.FullName, ui.Muted(r.PushedAt.Format("2006-01")))
+	}
+	if len(shown) < len(stale) {
+		fmt.Fprintf(w, "      … and %d more\n", len(stale)-len(shown))
+	}
+	return len(stale)
 }
 
 // fetchReadmes fills in the READMEs that are not already cached.

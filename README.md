@@ -103,6 +103,34 @@ repository topics on a 4,169-star account:
 The gain at 0.15 is small — close to noise — but the loss at 0.5 is not, which
 is the reason the default is low rather than absent.
 
+## Which stars take part
+
+Forks and archived repositories are left out by default, and
+`--include-forks` / `--include-archived` bring them back. Four more filters
+work from data the star list already carries, so none of them costs a request:
+
+```sh
+constellation plan --min-stars 25            # skip the ones nobody else uses
+constellation plan --starred-after 2y        # only what you starred recently
+constellation plan --exclude 'awesome-*'     # link farms group by nothing
+constellation plan --stale-after 3y          # report what has gone quiet
+```
+
+`--starred-after` and `--stale-after` take either a date (`2024-01-01`) or an
+age (`2y`, `18mo`, `30d`, `12h`); an age is what a script wants, since it keeps
+meaning the same thing tomorrow. `--exclude` is a glob, repeatable, matched
+against both `owner/name` and the bare name.
+
+Whatever is dropped is counted and reported by reason. Working from two thirds
+of an account without saying so would show up only as categories that make no
+sense.
+
+`--stale-after` **reports and filters nothing**. A repository that stopped
+being pushed to five years ago can be exactly the one worth keeping, and a
+tool that quietly dropped a fifth of an account would be wrong more often than
+right — but a dormant third of a star list is worth knowing about, and it is
+already in the data.
+
 ## Repositories in more than one list
 
 GitHub star lists are many-to-many, and a Rust command line tool genuinely
@@ -266,8 +294,11 @@ The plan is plain JSON. Renaming a category, deleting one, or moving a
 repository between them before you apply is expected — the names a model
 derives from term statistics are a starting point, not a verdict.
 
-`--markdown stars.md` also writes the categories as a linked index, which is
-useful on its own even if you never apply the plan.
+`--markdown stars.md` also writes the categories as a linked index, with each
+repository's stargazer count beside it, which is useful on its own even if you
+never apply the plan. The plan file records the star count and both dates —
+when it was pushed to, when you starred it — for every repository, so an index
+of your own can be sorted however you like.
 
 ## Applying safely
 
@@ -352,6 +383,10 @@ touched, and the repositories stay starred — only the grouping goes.
 | `--yes` / `-y` | `apply`, `reset` | Skip the confirmation prompt. Required for any non-interactive run. |
 | `--continue` | `apply` | Keep going when one repository fails instead of stopping. |
 | `--include-forks`, `--include-archived` | `plan` | Include stars that are otherwise filtered out; the run reports how many it skipped. |
+| `--min-stars N` | `plan` | Ignore repositories with fewer stargazers than this. |
+| `--starred-after` | `plan` | Ignore stars added before a date (`2024-01-01`) or an age ago (`2y`, `18mo`, `30d`). |
+| `--exclude GLOB` | `plan` | Ignore repositories matching this glob, repeatable; matched against `owner/name` and the bare name. |
+| `--stale-after` | `plan` | Report the stars with no push since a date or an age ago. Reports only — nothing is filtered. |
 | `--cache`, `--cache-ttl`, `--refresh` | `plan` | The star cache lives under your user cache directory (`stars.json`), is reused for 24 hours, and `--refresh` ignores it. |
 | `--readme-cache`, `--readme-cache-ttl`, `--refresh-readmes` | `plan` | The README cache is a separate file (`readmes.json`) with its own 30-day life, so re-fetching your stars does not re-read every README. `0` keeps them forever. |
 
