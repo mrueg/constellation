@@ -48,10 +48,30 @@ type Category struct {
 }
 
 // Repo is a repository placed in a category.
+//
+// Stars and the two dates are carried through because the plan is also read by
+// people and by scripts: they are what you sort an index by, and what tells a
+// dormant project from a live one. They cost nothing to record — every one of
+// them was already fetched with the star list.
 type Repo struct {
-	FullName    string  `json:"full_name"`
-	Description string  `json:"description,omitempty"`
-	Similarity  float64 `json:"similarity"`
+	FullName    string    `json:"full_name"`
+	Description string    `json:"description,omitempty"`
+	Similarity  float64   `json:"similarity"`
+	Stars       int       `json:"stars,omitempty"`
+	PushedAt    time.Time `json:"pushed_at,omitempty"`
+	StarredAt   time.Time `json:"starred_at,omitempty"`
+}
+
+// entry copies the parts of a repository the plan keeps.
+func entry(r gh.Repo, similarity float64) Repo {
+	return Repo{
+		FullName:    r.FullName,
+		Description: r.Description,
+		Similarity:  round(similarity),
+		Stars:       r.Stars,
+		PushedAt:    r.PushedAt,
+		StarredAt:   r.StarredAt,
+	}
 }
 
 const version = 1
@@ -88,11 +108,7 @@ func Build(user string, repos []gh.Repo, sp *embed.Space, res *cluster.Result, l
 		for _, m := range members {
 			sim := sp.Rows[m].Dot(res.Centroids[c])
 			sum += sim
-			cat.Repos = append(cat.Repos, Repo{
-				FullName:    repos[m].FullName,
-				Description: repos[m].Description,
-				Similarity:  round(sim),
-			})
+			cat.Repos = append(cat.Repos, entry(repos[m], sim))
 		}
 		cat.Cohesion = round(sum / float64(len(members)))
 		cat.Description = cluster.Describe(labels[c])
@@ -100,7 +116,7 @@ func Build(user string, repos []gh.Repo, sp *embed.Space, res *cluster.Result, l
 	}
 	for i, c := range res.Assign {
 		if c < 0 {
-			p.Unassigned = append(p.Unassigned, Repo{FullName: repos[i].FullName, Description: repos[i].Description})
+			p.Unassigned = append(p.Unassigned, entry(repos[i], 0))
 		}
 	}
 	return p
@@ -247,7 +263,7 @@ func (p *Plan) Markdown(w io.Writer) {
 	for _, c := range p.Categories {
 		fmt.Fprintf(w, "## %s (%d)\n\n%s\n\n", c.Name, len(c.Repos), c.Description)
 		for _, r := range c.Repos {
-			fmt.Fprintf(w, "- [%s](https://github.com/%s)", r.FullName, r.FullName)
+			fmt.Fprintf(w, "- [%s](https://github.com/%s)%s", r.FullName, r.FullName, stars(r.Stars))
 			if r.Description != "" {
 				fmt.Fprintf(w, " — %s", oneLine(r.Description))
 			}
@@ -258,9 +274,23 @@ func (p *Plan) Markdown(w io.Writer) {
 	if len(p.Unassigned) > 0 {
 		fmt.Fprintf(w, "## Uncategorized (%d)\n\n", len(p.Unassigned))
 		for _, r := range p.Unassigned {
-			fmt.Fprintf(w, "- [%s](https://github.com/%s)\n", r.FullName, r.FullName)
+			fmt.Fprintf(w, "- [%s](https://github.com/%s)%s\n", r.FullName, r.FullName, stars(r.Stars))
 		}
 		fmt.Fprintln(w)
+	}
+}
+
+// stars renders a stargazer count for the index, thousands abbreviated: an
+// index is read down the left edge, and "1.2k" keeps the descriptions from
+// being pushed out of line by five-digit numbers.
+func stars(n int) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n < 1000:
+		return fmt.Sprintf(" `★%d`", n)
+	default:
+		return fmt.Sprintf(" `★%.1fk`", float64(n)/1000)
 	}
 }
 

@@ -1285,3 +1285,49 @@ func TestForceRefusesToBeScoped(t *testing.T) {
 		t.Errorf("error does not explain why: %v", err)
 	}
 }
+
+// The index is read down its left edge, so a five-digit star count would push
+// every description out of line.
+func TestMarkdownShowsStarCounts(t *testing.T) {
+	p := &Plan{
+		User:       "octocat",
+		TotalStars: 3,
+		Categories: []Category{{
+			Name: "Go",
+			Repos: []Repo{
+				{FullName: "a/big", Stars: 190000, Description: "a large one"},
+				{FullName: "b/small", Stars: 42},
+				{FullName: "c/none"},
+			},
+		}},
+	}
+	var out strings.Builder
+	p.Markdown(&out)
+	for _, want := range []string{
+		"[a/big](https://github.com/a/big) `★190.0k` — a large one",
+		"[b/small](https://github.com/b/small) `★42`",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the index does not contain %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "c/none` ★") || strings.Contains(out.String(), "★0") {
+		t.Errorf("a repository with no stargazers got a count anyway:\n%s", out.String())
+	}
+}
+
+// The dates and the star count are already fetched with the star list, and the
+// plan is read by people and by scripts: they are what an index is sorted by.
+func TestBuildCarriesStarsAndDates(t *testing.T) {
+	pushed := time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC)
+	starred := time.Date(2023, 1, 2, 0, 0, 0, 0, time.UTC)
+	r := gh.Repo{FullName: "a/one", Stars: 12, PushedAt: pushed, StarredAt: starred}
+
+	got := entry(r, 0.5)
+	if got.Stars != 12 || !got.PushedAt.Equal(pushed) || !got.StarredAt.Equal(starred) {
+		t.Errorf("entry dropped fields: %+v", got)
+	}
+	if got.Similarity != 0.5 {
+		t.Errorf("similarity = %v, want 0.5", got.Similarity)
+	}
+}

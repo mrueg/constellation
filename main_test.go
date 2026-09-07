@@ -375,3 +375,118 @@ func TestUnreadableReadmesAreCached(t *testing.T) {
 		t.Errorf("harvested %d entries, want both failures recorded", changed)
 	}
 }
+
+// A date is what someone reaches for once; an age is what a script wants,
+// because it keeps meaning the same thing tomorrow. Go's own duration syntax
+// stops at hours, which is far too short a unit for a star list.
+func TestParseSince(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		in   string
+		want time.Time
+		bad  bool
+	}{
+		{"", time.Time{}, false},
+		{"2024-01-01", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), false},
+		{"2024-01-01T10:00:00Z", time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC), false},
+		{"2y", time.Date(2024, 9, 7, 12, 0, 0, 0, time.UTC), false},
+		{"18mo", time.Date(2025, 3, 7, 12, 0, 0, 0, time.UTC), false},
+		{"30d", time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC), false},
+		{"12h", time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC), false},
+		{"last tuesday", time.Time{}, true},
+		{"yesterday", time.Time{}, true}, // ends in a "y" but is not an age
+		{"xy", time.Time{}, true},
+	} {
+		got, err := parseSince(tc.in, now)
+		if tc.bad {
+			if err == nil {
+				t.Errorf("parseSince(%q) = %v, want an error naming the accepted forms", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseSince(%q): %v", tc.in, err)
+			continue
+		}
+		if !got.Equal(tc.want) {
+			t.Errorf("parseSince(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Every one of these was already fetched with the star list, so filtering on
+// them costs nothing. What matters is that a filtered-out star is reported:
+// silently working from two thirds of an account shows up only as categories
+// that make no sense.
+func TestRepoFilterApply(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	repos := []gh.Repo{
+		{FullName: "a/keep", Stars: 400, StarredAt: now.AddDate(0, -1, 0)},
+		{FullName: "b/forked", Fork: true, Stars: 400},
+		{FullName: "c/archived", Archived: true, Stars: 400},
+		{FullName: "d/tiny", Stars: 3, StarredAt: now},
+		{FullName: "e/ancient", Stars: 900, StarredAt: now.AddDate(-4, 0, 0)},
+		{FullName: "torvalds/linux", Stars: 190000, StarredAt: now},
+		{FullName: "someone/awesome-go", Stars: 100, StarredAt: now},
+	}
+	f := &planFlags{
+		minStars:     10,
+		starredAfter: "2y",
+		exclude:      []string{"torvalds/*", "awesome-*"},
+	}
+	rf, err := f.filter(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := rf.apply(repos)
+	if len(got) != 1 || got[0].FullName != "a/keep" {
+		names := make([]string, len(got))
+		for i, r := range got {
+			names[i] = r.FullName
+		}
+		t.Errorf("kept %v, want only a/keep", names)
+	}
+}
+
+// A glob or a date that cannot be read must stop the run before it costs a
+// walk through every page of stars.
+func TestFilterRejectsBadFlagsBeforeFetching(t *testing.T) {
+	now := time.Now()
+	if _, err := (&planFlags{starredAfter: "yesterday"}).filter(now); err == nil {
+		t.Error("a date that cannot be parsed was accepted")
+	}
+	if _, err := (&planFlags{exclude: []string{"[bad"}}).filter(now); err == nil {
+		t.Error("a malformed glob was accepted")
+	}
+}
+
+// Dormant stars are reported, never dropped: a repository that stopped being
+// pushed to can be exactly the one worth keeping, and the flag says nothing
+// about whether it belongs in a list.
+func TestReportStale(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	repos := []gh.Repo{
+		{FullName: "a/live", PushedAt: now.AddDate(0, -1, 0)},
+		{FullName: "b/quiet", PushedAt: now.AddDate(-5, 0, 0)},
+		{FullName: "c/quieter", PushedAt: now.AddDate(-9, 0, 0)},
+		{FullName: "d/unknown"},
+	}
+	var out strings.Builder
+	if n := reportStale(repos, now.AddDate(-2, 0, 0), &out); n != 2 {
+		t.Errorf("reported %d stale stars, want 2", n)
+	}
+	if !strings.Contains(out.String(), "c/quieter") || !strings.Contains(out.String(), "b/quiet") {
+		t.Errorf("the report does not name the dormant repositories:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "a/live") || strings.Contains(out.String(), "d/unknown") {
+		t.Errorf("the report names a repository it should not:\n%s", out.String())
+	}
+	if i, j := strings.Index(out.String(), "c/quieter"), strings.Index(out.String(), "b/quiet"); i > j {
+		t.Error("the report is not ordered oldest first")
+	}
+
+	out.Reset()
+	if n := reportStale(repos, time.Time{}, &out); n != 0 || out.Len() != 0 {
+		t.Errorf("an unset --stale-after reported %d stars and wrote %q", n, out.String())
+	}
+}
