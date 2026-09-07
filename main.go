@@ -235,7 +235,9 @@ type planFlags struct {
 
 	cachePath       string
 	cacheMaxAge     time.Duration
+	cacheFullAge    time.Duration
 	refresh         bool
+	incremental     bool
 	readmeCachePath string
 	readmeMaxAge    time.Duration
 	refreshReadmes  bool
@@ -297,7 +299,8 @@ func (f *planFlags) flags() []cli.Flag {
 		&cli.IntFlag{Name: "max-vocab", Value: 12000, Usage: "cap on the vocabulary the model is built from", Destination: &f.maxVocab},
 
 		&cli.StringFlag{Name: "cache", Value: gh.DefaultCachePath(), Usage: "where to cache your stars", Destination: &f.cachePath},
-		&cli.DurationFlag{Name: "cache-ttl", Value: 24 * time.Hour, Usage: "how long a cached star list stays usable", Destination: &f.cacheMaxAge},
+		&cli.DurationFlag{Name: "cache-ttl", Value: 24 * time.Hour, Usage: "how long a cached star list stays usable before it is topped up from the API", Destination: &f.cacheMaxAge},
+		&cli.DurationFlag{Name: "cache-full-ttl", Value: 30 * 24 * time.Hour, Usage: "how old a cached star list may get before it is re-read in full rather than topped up, so that descriptions and topics do not stay stale forever; 0 tops up indefinitely", Destination: &f.cacheFullAge},
 		&cli.BoolFlag{Name: "refresh", Usage: "ignore the star cache and re-fetch the star list; cached READMEs are kept, see --refresh-readmes", Destination: &f.refresh},
 		&cli.StringFlag{Name: "readme-cache", Value: gh.DefaultReadmeCachePath(), Usage: "where to cache the README openings", Destination: &f.readmeCachePath},
 		&cli.DurationFlag{Name: "readme-cache-ttl", Value: 30 * 24 * time.Hour, Usage: "how long a cached README stays usable; 0 keeps it forever", Destination: &f.readmeMaxAge},
@@ -306,6 +309,7 @@ func (f *planFlags) flags() []cli.Flag {
 		&cli.BoolFlag{Name: "include-archived", Usage: "include starred archived repositories", Destination: &f.includeArchived},
 		&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}, Usage: "list every repository in every category", Destination: &f.verbose},
 		&cli.IntFlag{Name: "show", Usage: "print only the first N categories (0 = all); the plan file always holds every one", Sources: cli.EnvVars(envShow), Destination: &f.show},
+		&cli.BoolFlag{Name: "incremental", Usage: "file only the stars that are new since the plan at --out into its existing categories, leaving every category and every placement already made alone; the clustering flags do not apply", Destination: &f.incremental},
 		&cli.BoolFlag{Name: "apply", Usage: "apply the plan straight away instead of only writing it", Destination: &f.apply},
 	}
 }
@@ -358,9 +362,24 @@ func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
 		progress("not reading existing lists: %v", err)
 		lists = nil
 	}
-	p, err := buildPlan(ctx, lists, user, repos, f)
-	if err != nil {
-		return err
+	var p *plan.Plan
+	if f.incremental {
+		prev, lerr := plan.Load(f.out)
+		switch {
+		case lerr == nil:
+			if p, err = extendPlan(ctx, lists, user, repos, f, prev); err != nil {
+				return err
+			}
+		case errors.Is(lerr, os.ErrNotExist):
+			progress("no plan at %s yet, so there is nothing to extend; planning from scratch", f.out)
+		default:
+			return lerr
+		}
+	}
+	if p == nil {
+		if p, err = buildPlan(ctx, lists, user, repos, f); err != nil {
+			return err
+		}
 	}
 	p.Stamp(time.Now())
 
@@ -406,9 +425,10 @@ func writeMarkdown(p *plan.Plan, path string) (err error) {
 	return buf.Flush()
 }
 
-// buildPlan runs the model: embed the repositories, cluster them, name the
-// clusters, and reconcile against the lists that already exist.
-func buildPlan(ctx context.Context, lists *gh.ListsClient, user string, repos []gh.Repo, f *planFlags) (*plan.Plan, error) {
+// embedRepos turns the repositories into the vectors both planning paths work
+// from: a full run clusters them, an incremental one measures new stars
+// against the categories a previous run produced.
+func embedRepos(ctx context.Context, repos []gh.Repo, f *planFlags) ([]embed.Doc, *embed.Space, error) {
 	// The vocabulary of topics the collection already uses, so that a
 	// repository nobody labelled can be matched against its neighbours'.
 	var topicLists [][]string
@@ -438,14 +458,24 @@ func buildPlan(ctx context.Context, lists *gh.ListsClient, user string, repos []
 	progress("embedding %d repositories with %s", len(repos), emb.Name())
 	sp, err := emb.Embed(ctx, docs)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if sp.Dim == 0 {
 		// --min-df 1 alone is a trap: terms seen in exactly one repository
 		// outnumber the vocabulary cap, and since the cap keeps the rarest
 		// terms the whole vocabulary becomes words that by definition group
 		// nothing. Lifting the cap at the same time is what actually works.
-		return nil, fmt.Errorf("the corpus produced an empty vocabulary; try --min-df 1 --max-vocab 0")
+		return nil, nil, fmt.Errorf("the corpus produced an empty vocabulary; try --min-df 1 --max-vocab 0")
+	}
+	return docs, sp, nil
+}
+
+// buildPlan runs the model: embed the repositories, cluster them, name the
+// clusters, and reconcile against the lists that already exist.
+func buildPlan(ctx context.Context, lists *gh.ListsClient, user string, repos []gh.Repo, f *planFlags) (*plan.Plan, error) {
+	docs, sp, err := embedRepos(ctx, repos, f)
+	if err != nil {
+		return nil, err
 	}
 
 	switch {
@@ -501,27 +531,133 @@ func buildPlan(ctx context.Context, lists *gh.ListsClient, user string, repos []
 	res = cluster.Soften(sp, res, f.multiRatio, f.multiList)
 	labels := cluster.Names(docs, res.Assign, res.K, 6)
 
-	// Existing lists are read so the plan can tell new categories from ones
-	// already on the account. Failing to read them is not fatal: the plan is
-	// still valid, it just cannot mark which lists already exist.
-	var existing []gh.List
-	if lists != nil {
-		if ls, err := lists.Lists(ctx); err == nil {
-			existing = ls
-		} else {
-			progress("could not read existing lists: %v", err)
-		}
-	}
+	existing := existingLists(ctx, lists)
 	p := plan.Build(user, repos, sp, res, labels, existing)
 	p.Settings = f.settings()
+	warnListBudget(p, existing)
+	return p, nil
+}
 
-	// Existing lists spend the same budget as new ones, so a plan that fits on
-	// its own can still be too big for the account.
+// extendPlan files the stars that are new since a plan was written into that
+// plan's categories, and changes nothing else.
+//
+// This is the everyday run. Re-clustering from scratch to place a handful of
+// new stars is not only slower, it moves repositories between lists that were
+// reviewed and applied weeks ago — the categories are one reasonable cut of
+// several, and the cut moves when the corpus does. Here the categories, their
+// names and every placement already made are taken as given, and only the
+// newcomers are decided.
+//
+// Everything is re-embedded even so: adding repositories changes the term
+// statistics underneath, and measuring a newcomer against centroids computed
+// in a different space would compare two things that are not comparable. It
+// costs CPU, not API calls.
+func extendPlan(ctx context.Context, lists *gh.ListsClient, user string, repos []gh.Repo, f *planFlags, prev *plan.Plan) (*plan.Plan, error) {
+	if prev.User != "" && prev.User != user {
+		return nil, fmt.Errorf("%s holds a plan for %s, but the token belongs to %s", f.out, prev.User, user)
+	}
+	if len(prev.Categories) == 0 {
+		progress("the plan at %s has no categories to extend; planning from scratch", f.out)
+		return buildPlan(ctx, lists, user, repos, f)
+	}
+	_, sp, err := embedRepos(ctx, repos, f)
+	if err != nil {
+		return nil, err
+	}
+
+	at := make(map[string]int, len(repos))
+	for i, r := range repos {
+		at[r.FullName] = i
+	}
+	assign := make([]int, len(repos))
+	for i := range assign {
+		assign[i] = -1
+	}
+	also := make([][]int, len(repos))
+	// Every repository the plan has already decided on, placed or not: one it
+	// deliberately left uncategorized must not be reconsidered here, or an
+	// incremental run would quietly differ from the run that produced it.
+	decided := make(map[string]bool, prev.TotalStars)
+	for c, cat := range prev.Categories {
+		for _, r := range cat.Repos {
+			decided[r.FullName] = true
+			i, ok := at[r.FullName]
+			if !ok {
+				continue // unstarred since the plan was written
+			}
+			// A plan records the repositories in each category, not which
+			// category claimed them first, so the first one listed stands as
+			// the primary and the rest as secondary memberships.
+			if assign[i] < 0 {
+				assign[i] = c
+			} else {
+				also[i] = append(also[i], c)
+			}
+		}
+	}
+	for _, r := range prev.Unassigned {
+		decided[r.FullName] = true
+	}
+
+	var todo []int
+	for i, r := range repos {
+		if !decided[r.FullName] {
+			todo = append(todo, i)
+		}
+	}
+	res := cluster.FromMembership(sp, assign, also, len(prev.Categories))
+	placed := cluster.Place(sp, res, todo, cluster.PlaceOptions{
+		MinSimilarity: f.minSimilarity, OutlierSigmas: f.outlierSigmas,
+		MultiLists: f.multiList, MultiRatio: f.multiRatio,
+	})
+	progress("%d stars are new since the plan of %s: %d filed into existing categories, %d fit none well enough",
+		len(todo), prev.GeneratedAt.Format(time.RFC822), placed, len(todo)-placed)
+
+	labels := make([]cluster.Label, len(prev.Categories))
+	described := make(map[string]string, len(prev.Categories))
+	for c, cat := range prev.Categories {
+		labels[c] = cluster.Label{Name: cat.Name, TopTerms: cat.Terms}
+		described[cat.Name] = cat.Description
+	}
+	existing := existingLists(ctx, lists)
+	p := plan.Build(user, repos, sp, res, labels, existing)
+	// Names and descriptions are carried over verbatim, including any a person
+	// edited: rewriting them from term statistics is exactly the churn an
+	// incremental run exists to avoid.
+	for i := range p.Categories {
+		if d, ok := described[p.Categories[i].Name]; ok && d != "" {
+			p.Categories[i].Description = d
+		}
+	}
+	p.Settings = f.settings()
+	p.Settings["incremental"] = "true"
+	warnListBudget(p, existing)
+	return p, nil
+}
+
+// existingLists reads the star lists already on the account. Failing to read
+// them is not fatal: the plan is still valid, it just cannot mark which
+// categories already exist.
+func existingLists(ctx context.Context, lists *gh.ListsClient) []gh.List {
+	if lists == nil {
+		return nil
+	}
+	ls, err := lists.Lists(ctx)
+	if err != nil {
+		progress("could not read existing lists: %v", err)
+		return nil
+	}
+	return ls
+}
+
+// warnListBudget reports a plan that cannot fit. Existing lists spend the same
+// budget as new ones, so a plan that fits on its own can still be too big for
+// the account.
+func warnListBudget(p *plan.Plan, existing []gh.List) {
 	if fresh := p.NewLists(); len(existing)+fresh > gh.MaxLists {
 		progress("warning: GitHub allows %d star lists and you already have %d, but this plan adds %d new ones; "+
 			"re-run with --max-clusters %d to fit", gh.MaxLists, len(existing), fresh, gh.MaxLists-len(existing))
 	}
-	return p, nil
 }
 
 // settings records the tuning that produced a plan. Only the knobs that change
@@ -619,6 +755,13 @@ func loadStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([]
 			progress("using %d cached stars from %s (--refresh to re-fetch)", len(repos), at.Format(time.RFC822))
 			return repos, nil
 		}
+		topped, ok, err := topUpStars(ctx, c, user, f)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return topped, nil
+		}
 	}
 	repos, err := c.Starred(ctx)
 	if err != nil {
@@ -628,6 +771,41 @@ func loadStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([]
 		progress("could not write cache: %v", err)
 	}
 	return repos, nil
+}
+
+// topUpStars brings an expired star cache up to date by re-reading its last
+// page onwards, rather than walking every page again to find the three stars
+// added since yesterday. It reports ok=false when that cannot be done
+// soundly — an unstar shifts the whole list — and the caller falls back to a
+// full read.
+//
+// The cache is still re-read in full once it passes --cache-full-ttl: a
+// topped-up cache never revisits the repositories already in it, so a
+// description rewritten or a topic added upstream would otherwise never reach
+// the model.
+func topUpStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([]gh.Repo, bool, error) {
+	stale, at, err := gh.LoadCache(f.cachePath, user, 0)
+	if err != nil || len(stale) == 0 {
+		return nil, false, err
+	}
+	if f.cacheFullAge > 0 && time.Since(at) > f.cacheFullAge {
+		progress("the star cache is older than --cache-full-ttl; re-reading every page")
+		return nil, false, nil
+	}
+	merged, ok, err := c.StarredIncremental(ctx, stale)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		progress("the star list has shifted since the cache was written; re-reading every page")
+		return nil, false, nil
+	}
+	progress("topped up %d cached stars from %s: %d now, %d added or removed",
+		len(stale), at.Format(time.RFC822), len(merged), len(merged)-len(stale))
+	if err := gh.SaveCache(f.cachePath, user, merged); err != nil {
+		progress("could not write cache: %v", err)
+	}
+	return merged, true, nil
 }
 
 func filterRepos(repos []gh.Repo, f *planFlags) []gh.Repo {

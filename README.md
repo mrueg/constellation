@@ -332,6 +332,51 @@ and names the command that fixes it, rather than repeating the same refusal for
 every repository. Grant the scope and run the same command again: applying is
 idempotent and resumes where it left off.
 
+## Re-running it later
+
+```sh
+constellation plan --incremental   # file only what is new
+constellation apply
+```
+
+The first run is the expensive one. Afterwards two things are usually true:
+almost nothing has changed, and the lists have already been reviewed and
+applied — so the everyday run should cost little and disturb nothing.
+
+**Reading is incremental by itself.** Stars come back oldest first, so
+everything already cached keeps its position and new stars land at the end.
+When the cache is past `--cache-ttl`, `constellation` re-reads the last cached
+page onwards rather than walking every page again: two requests instead of one
+per hundred stars. Removing a star shifts the whole list, which would otherwise
+go unnoticed for as long as the cache lived, so the overlap is checked rather
+than trusted — the page that should still hold the cached tail has to hold
+exactly it, in order. When it does not, the list is re-read in full, which is
+what the previous version did every time. `--cache-full-ttl` (30 days) forces
+a full re-read eventually, since a topped-up cache never revisits the
+repositories already in it and a description rewritten upstream would
+otherwise never reach the model.
+
+**`--incremental` extends the plan instead of replacing it.** The categories,
+their names, their descriptions and every placement already made are taken as
+given, and only the stars that are new since the plan was written are decided.
+This matters more than the time it saves: re-clustering from scratch to place
+six new repositories moves ones that were filed weeks ago, because thirty
+categories are one reasonable cut of several and the cut moves when the corpus
+does. The clustering flags have nothing to do under `--incremental`; the
+placement flags — `--min-similarity`, `--outlier-sigmas`, `--multi-list` — still
+apply, so a newcomer clears the same bar its neighbours did, and one that fits
+nothing is reported as uncategorized rather than pushed into the nearest list.
+
+Everything is re-embedded even so: adding repositories changes the term
+statistics underneath, and measuring a newcomer against centroids built in a
+different space would compare two things that are not comparable. That costs
+CPU, not API calls. A repository the plan already left uncategorized stays
+uncategorized — reconsidering it would make an incremental run quietly differ
+from the run that produced the plan — and one you have since unstarred drops
+out. The plan records `incremental: true` in its settings.
+
+With no plan at `--out` yet, `--incremental` plans from scratch and says so.
+
 ## Undoing it
 
 ```sh
@@ -352,7 +397,8 @@ touched, and the repositories stay starred — only the grouping goes.
 | `--yes` / `-y` | `apply`, `reset` | Skip the confirmation prompt. Required for any non-interactive run. |
 | `--continue` | `apply` | Keep going when one repository fails instead of stopping. |
 | `--include-forks`, `--include-archived` | `plan` | Include stars that are otherwise filtered out; the run reports how many it skipped. |
-| `--cache`, `--cache-ttl`, `--refresh` | `plan` | The star cache lives under your user cache directory (`stars.json`), is reused for 24 hours, and `--refresh` ignores it. |
+| `--incremental` | `plan` | File only the stars that are new since the plan at `--out`, leaving its categories and placements alone. See above. |
+| `--cache`, `--cache-ttl`, `--cache-full-ttl`, `--refresh` | `plan` | The star cache lives under your user cache directory (`stars.json`) and is reused for 24 hours; past that it is topped up from the end rather than re-read, until `--cache-full-ttl` (30 days). `--refresh` re-reads every page. |
 | `--readme-cache`, `--readme-cache-ttl`, `--refresh-readmes` | `plan` | The README cache is a separate file (`readmes.json`) with its own 30-day life, so re-fetching your stars does not re-read every README. `0` keeps them forever. |
 
 ## License
