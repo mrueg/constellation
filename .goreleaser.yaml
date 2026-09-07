@@ -42,6 +42,38 @@ archives:
       - src: completions/*
         dst: completions
 
+# Record what went into each archive, so a consumer can scan a release for
+# known vulnerabilities without unpacking it and guessing at the dependency
+# set.
+sboms:
+  - artifacts: archive
+
+# Sign the checksum file with cosign in keyless mode: the signing identity is
+# the GitHub Actions OIDC token for this workflow, so no private key has to be
+# held anywhere. Signing the checksums covers every archive it lists, since a
+# tampered archive would fail its checksum.
+#
+# cosign v3 writes the certificate and the signature together into one bundle;
+# the older --output-certificate/--output-signature pair is rejected outright.
+#
+# Verify a download with:
+#
+#	cosign verify-blob \
+#	  --bundle checksums.txt.bundle \
+#	  --certificate-identity-regexp 'https://github.com/mrueg/constellation/.*' \
+#	  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#	  checksums.txt
+signs:
+  - cmd: cosign
+    signature: "${artifact}.bundle"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - --yes
+    artifacts: checksum
+    output: true
+
 # Publish a Homebrew cask to the personal tap, so the binary can be installed
 # with `brew install mrueg/tap/constellation` rather than by unpacking a
 # tarball. A cask rather than a formula because these are prebuilt binaries;
