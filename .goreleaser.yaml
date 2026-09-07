@@ -42,6 +42,33 @@ archives:
       - src: completions/*
         dst: completions
 
+# Publish a Homebrew cask to the personal tap, so the binary can be installed
+# with `brew install mrueg/tap/constellation` rather than by unpacking a
+# tarball. A cask rather than a formula because these are prebuilt binaries;
+# a formula would be expected to build from source.
+#
+# The tap lives in another repository, so the default GITHUB_TOKEN cannot write
+# to it — TAP_GITHUB_TOKEN is a token with access to that one.
+homebrew_casks:
+  - repository:
+      owner: mrueg
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/mrueg/constellation"
+    description: "Turns your GitHub stars into organized star lists using an unsupervised ML model"
+    license: "Apache-2.0"
+    commit_author:
+      name: Manuel Rüger
+      email: manuel@rueg.eu
+    commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
+    directory: Casks
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/constellation"]
+          end
+
 checksum:
   name_template: checksums.txt
 

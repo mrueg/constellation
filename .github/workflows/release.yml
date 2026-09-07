@@ -28,3 +28,6 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The cask is committed to mrueg/homebrew-tap, which the automatic
+          # GITHUB_TOKEN has no write access to.
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
