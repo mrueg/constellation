@@ -7,7 +7,7 @@ require (
 	github.com/fatih/color v1.19.0
 	github.com/google/go-github/v90 v90.0.0
 	github.com/kljensen/snowball v0.10.0
-	github.com/mattn/go-runewidth v0.0.29
+	github.com/mattn/go-runewidth v0.0.30
 	github.com/urfave/cli/v3 v3.11.0
 	gonum.org/v1/gonum v0.17.0
 )
