@@ -355,3 +355,28 @@ func TestDropUnnamedIsOffAtZero(t *testing.T) {
 		t.Errorf("got %d categories, want 3 untouched", got.K)
 	}
 }
+
+// A name is redundant when it repeats a word, not when it happens to contain
+// the letters: "Go & Django" was collapsing to "Go".
+func TestRedundantComparesWholeWords(t *testing.T) {
+	for _, tc := range []struct {
+		parts []string
+		p     string
+		want  bool
+	}{
+		{[]string{"Go"}, "Django", false},
+		{[]string{"Rust"}, "Trust", false},
+		{[]string{"API"}, "Rapid", false},
+		{[]string{"Git"}, "Digital", false},
+		{[]string{"Go"}, "Go", true},
+		{[]string{"Go"}, "go", true},
+		{[]string{"Machine Learning"}, "Learning", true},
+		{[]string{"Kubernetes"}, "Kubernetes Operator", true},
+		{[]string{"Helm", "Charts"}, "Helm Chart", true},
+		{[]string{"Helm", "Charts"}, "Chart", false},
+	} {
+		if got := redundant(tc.parts, tc.p); got != tc.want {
+			t.Errorf("redundant(%v, %q) = %v, want %v", tc.parts, tc.p, got, tc.want)
+		}
+	}
+}

@@ -16,6 +16,11 @@ var (
 // stripMarkdown reduces a README to prose. Badges, code blocks and link URLs
 // are pure noise for categorization — a shields.io URL appears in thousands of
 // unrelated repositories and would cluster them together.
+//
+// The tokenizer strips badges, links, HTML and URLs again on its own, so that
+// READMEs cached before this existed are covered too. What only belongs here
+// is what needs the raw markdown: fenced code blocks and heading and emphasis
+// punctuation, which the cache should never have to store.
 func stripMarkdown(s string) string {
 	s = fenced.ReplaceAllString(s, " ")
 	s = badgeImg.ReplaceAllString(s, " ")
