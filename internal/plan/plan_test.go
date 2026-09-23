@@ -36,6 +36,8 @@ type fakeGitHub struct {
 	posts     int                 // mutations received
 	listReads int                 // list queries served
 	itemReads map[string]int      // list id -> content pages served
+	idReads   int                 // repository id resolutions served
+	unknown   map[string]bool     // repositories GitHub no longer knows
 	failWith  string              // when set, every request answers with this GraphQL error type
 }
 
@@ -193,8 +195,11 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, b.String())
 
 	case strings.Contains(q, "repository(owner:"):
-		// RepoIDs resolves names to node ids with one aliased field each.
-		var b strings.Builder
+		// RepoIDs resolves names to node ids with one aliased field each. A
+		// repository GitHub no longer knows comes back null alongside a
+		// NOT_FOUND error, with the rest of the answer intact.
+		f.idReads++
+		var b, errs strings.Builder
 		b.WriteString(`{"data":{`)
 		first := true
 		for _, m := range regexp.MustCompile(`(r\d+): repository\(owner: "([^"]*)", name: "([^"]*)"\)`).FindAllStringSubmatch(q, -1) {
@@ -203,9 +208,21 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			first = false
 			full := m[2] + "/" + m[3]
+			if f.unknown[full] {
+				fmt.Fprintf(&b, `%q:null`, m[1])
+				if errs.Len() > 0 {
+					errs.WriteString(",")
+				}
+				fmt.Fprintf(&errs, `{"type":"NOT_FOUND","path":[%q],"message":"Could not resolve to a Repository with the name '%s'."}`, m[1], full)
+				continue
+			}
 			fmt.Fprintf(&b, `%q:{"id":"id:%s","nameWithOwner":%q}`, m[1], full, full)
 		}
-		b.WriteString(`}}`)
+		b.WriteString(`}`)
+		if errs.Len() > 0 {
+			fmt.Fprintf(&b, `,"errors":[%s]`, errs.String())
+		}
+		b.WriteString(`}`)
 		fmt.Fprint(w, b.String())
 
 	case strings.Contains(q, "node(id:"):
@@ -1521,6 +1538,53 @@ func TestValidateCatchesHandEdits(t *testing.T) {
 			t.Errorf("want one line per problem (3), got %d:\n%v", n, err)
 		}
 	})
+}
+
+// A dry run has to resolve repository ids like a real run does: that lookup is
+// what tells a repository GitHub no longer knows from one that can be filed,
+// and skipping it made the preview promise "would file" for a repository the
+// real run then rejected. Both runs must report the same outcome.
+func TestDryRunResolvesRepositoryIDs(t *testing.T) {
+	for _, dryRun := range []bool{true, false} {
+		t.Run(fmt.Sprintf("dryRun=%v", dryRun), func(t *testing.T) {
+			f, c, p := testSetup(t)
+			f.unknown = map[string]bool{"k3s-io/k3s": true}
+
+			// Without --continue the unknown repository stops the run, dry or
+			// not.
+			_, err := Apply(context.Background(), c, p, ApplyOptions{DryRun: dryRun, Out: io.Discard})
+			if err == nil || !strings.Contains(err.Error(), "does not know this repository") {
+				t.Errorf("an unknown repository was accepted: %v", err)
+			}
+
+			f2, c2, p2 := testSetup(t)
+			f2.unknown = map[string]bool{"k3s-io/k3s": true}
+			var out bytes.Buffer
+			res, err := Apply(context.Background(), c2, p2, ApplyOptions{
+				DryRun: dryRun, ContinueOnError: true, Out: &out,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.ReposFiled != 2 || len(res.Errors) != 1 {
+				t.Errorf("filed %d with %d errors, want 2 and 1", res.ReposFiled, len(res.Errors))
+			}
+			if !strings.Contains(out.String(), "k3s-io/k3s: unknown to GitHub") {
+				t.Errorf("the unknown repository was not called out:\n%s", out.String())
+			}
+			if strings.Contains(out.String(), "would file k3s-io/k3s") {
+				t.Errorf("a dry run offered to file a repository GitHub does not know:\n%s", out.String())
+			}
+			f2.mu.Lock()
+			defer f2.mu.Unlock()
+			if f2.idReads == 0 {
+				t.Error("repository ids were never resolved")
+			}
+			if dryRun && f2.posts != 0 {
+				t.Errorf("a dry run sent %d writes", f2.posts)
+			}
+		})
+	}
 }
 
 // A too-long name used to fail at CreateList, after --reconcile had already
