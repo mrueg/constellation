@@ -124,33 +124,68 @@ func synthRepos(n int) []gh.Repo {
 // number of categories asked for: a new account, or a heavily filtered one.
 // Naming and refinement are the stages that assume a cluster has members.
 func TestBuildPlanSurvivesTinyCollections(t *testing.T) {
-	f := defaultPlanFlags(t)
-	for _, n := range []int{0, 1, 2, 5, 12, 60} {
-		p, err := buildPlan(context.Background(), nil, "octocat", synthRepos(n), f)
-		if err != nil {
-			// Too little text to build a vocabulary from is a fair answer, as
-			// long as it arrives as an error naming the remedy rather than as
-			// a panic or an empty plan presented as a real one.
-			if !strings.Contains(err.Error(), "--") {
-				t.Errorf("n=%d: unhelpful failure: %v", n, err)
+	for _, algorithm := range []string{"agglomerative", "kmeans"} {
+		f := defaultPlanFlags(t)
+		f.algorithm = algorithm
+		for _, n := range []int{0, 1, 2, 3, 5, 12, 60} {
+			label := fmt.Sprintf("%s n=%d", algorithm, n)
+			p, err := buildPlan(context.Background(), nil, "octocat", synthRepos(n), f)
+			if err != nil {
+				// Too little text to build a vocabulary from is a fair answer,
+				// as long as it arrives as an error naming the remedy rather
+				// than as a panic or an empty plan presented as a real one.
+				if !strings.Contains(err.Error(), "--") {
+					t.Errorf("%s: unhelpful failure: %v", label, err)
+				}
+				t.Logf("%s: %v", label, err)
+				continue
 			}
-			t.Logf("n=%d: %v", n, err)
-			continue
+			seen := map[string]bool{}
+			placed := 0
+			for _, c := range p.Categories {
+				if c.Name == "" {
+					t.Errorf("%s: a category came out unnamed", label)
+				}
+				if seen[c.Name] {
+					t.Errorf("%s: duplicate category %q", label, c.Name)
+				}
+				seen[c.Name] = true
+				placed += len(c.Repos)
+			}
+			if placed > n {
+				t.Errorf("%s: %d placements from %d repositories", label, placed, n)
+			}
 		}
-		seen := map[string]bool{}
-		placed := 0
-		for _, c := range p.Categories {
-			if c.Name == "" {
-				t.Errorf("n=%d: a category came out unnamed", n)
+	}
+}
+
+// Under the default vocabulary floor a handful of repositories never reaches
+// the clustering at all, so the k-means path is exercised here with the
+// floor lifted: the silhouette sweep used to come back empty on one, two or
+// three repositories, and the refinement step then dereferenced nothing.
+func TestBuildPlanKMeansSurvivesTinyCollections(t *testing.T) {
+	for _, consensus := range []int{1, 3} {
+		f := defaultPlanFlags(t)
+		f.algorithm = "kmeans"
+		f.consensus = consensus
+		f.minDF, f.maxVocab = 1, 0
+		for _, n := range []int{1, 2, 3} {
+			label := fmt.Sprintf("consensus=%d n=%d", consensus, n)
+			p, err := buildPlan(context.Background(), nil, "octocat", synthRepos(n), f)
+			if err != nil {
+				if !strings.Contains(err.Error(), "--") {
+					t.Errorf("%s: unhelpful failure: %v", label, err)
+				}
+				t.Logf("%s: %v", label, err)
+				continue
 			}
-			if seen[c.Name] {
-				t.Errorf("n=%d: duplicate category %q", n, c.Name)
+			placed := 0
+			for _, c := range p.Categories {
+				placed += len(c.Repos)
 			}
-			seen[c.Name] = true
-			placed += len(c.Repos)
-		}
-		if placed > n {
-			t.Errorf("n=%d: %d placements from %d repositories", n, placed, n)
+			if placed > n {
+				t.Errorf("%s: %d placements from %d repositories", label, placed, n)
+			}
 		}
 	}
 }

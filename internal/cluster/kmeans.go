@@ -71,17 +71,19 @@ func Run(sp *embed.Space, opt Options) *Result {
 	if n == 0 {
 		return &Result{}
 	}
+	// Never ask for more clusters than there are repositories. Beyond n the
+	// extra centroids can only ever be empty, and the silhouette has nothing
+	// to say about a partition of singletons.
 	if opt.K > 0 {
-		return best(sp, opt.K, opt)
+		return best(sp, min(opt.K, n), opt)
 	}
 
 	minK, maxK := opt.MinK, opt.MaxK
 	if minK < 2 {
 		minK = 2
 	}
-	if maxK > n {
-		maxK = n
-	}
+	minK = min(minK, n)
+	maxK = min(maxK, n)
 	if maxK < minK {
 		maxK = minK
 	}
@@ -92,7 +94,13 @@ func Run(sp *embed.Space, opt Options) *Result {
 	for k := minK; k <= maxK; k += kStep(minK, maxK) {
 		r := best(sp, k, opt)
 		sil := silhouette(sp, r, sample)
-		if sil > bestSil {
+		if math.IsNaN(sil) {
+			sil = math.Inf(-1)
+		}
+		// The smallest K is kept when nothing can be scored — one or two
+		// repositories, or a corpus of identical rows — so that the sweep
+		// always hands back a result, and a deterministic one.
+		if bestRes == nil || sil > bestSil {
 			bestSil, bestRes = sil, r
 		}
 	}

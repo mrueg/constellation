@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand"
 	"strings"
@@ -388,5 +389,74 @@ func TestRelativeFloorUnchangedForPositiveMedians(t *testing.T) {
 		if got, want := relativeFloor(med), outlierRelativeGuard*med; math.Abs(got-want) > 1e-12 {
 			t.Errorf("median %+.2f: floor %+.6f, want the previous %+.6f", med, got, want)
 		}
+	}
+}
+
+// tinySpace builds n distinct L2-normalized two-dimensional rows, the shape
+// of corpus that a brand-new account hands to the clustering.
+func tinySpace(n int) *embed.Space {
+	sp := &embed.Space{Dim: 2, Terms: []string{"a", "b"}}
+	for i := range n {
+		sp.Rows = append(sp.Rows, embed.Normalize([]int32{0, 1}, []float32{float32(i + 1), 1}))
+	}
+	return sp
+}
+
+// checkTiny is what every clustering has to guarantee on a corpus of n rows:
+// a result exists, every row has an assignment, and no assignment points past
+// the clusters that were formed.
+func checkTiny(t *testing.T, label string, n int, res *Result) {
+	t.Helper()
+	if res == nil {
+		t.Fatalf("%s: no result", label)
+	}
+	if len(res.Assign) != n {
+		t.Fatalf("%s: %d assignments for %d rows", label, len(res.Assign), n)
+	}
+	if res.K > n {
+		t.Errorf("%s: K=%d exceeds %d rows", label, res.K, n)
+	}
+	if n > 0 && res.K < 1 {
+		t.Errorf("%s: K=%d with %d rows", label, res.K, n)
+	}
+	for i, c := range res.Assign {
+		if c >= res.K || c < -1 {
+			t.Errorf("%s: row %d assigned to cluster %d of %d", label, i, c, res.K)
+		}
+	}
+	if len(res.Centroids) != res.K {
+		t.Errorf("%s: K=%d but %d centroids", label, res.K, len(res.Centroids))
+	}
+}
+
+// The silhouette sweep that picks K has nothing to score when every point is
+// a singleton, and used to hand back no result at all; the caller then
+// dereferenced it. The command line defaults are the case that matters: a
+// minimum of six categories against one, two or three repositories.
+func TestKMeansSurvivesTinyCorpora(t *testing.T) {
+	opt := Options{MinK: 6, MaxK: 32, Restarts: 2, MaxIter: 20, Seed: 1}
+	for _, n := range []int{0, 1, 2, 3} {
+		checkTiny(t, fmt.Sprintf("n=%d", n), n, Run(tinySpace(n), opt))
+	}
+}
+
+// Identical rows give a silhouette of 0/0 for every K, so no K ever wins the
+// sweep. The clustering still owes the caller an answer.
+func TestKMeansSurvivesIdenticalRows(t *testing.T) {
+	const n = 50
+	sp := &embed.Space{Dim: 2, Terms: []string{"a", "b"}}
+	for range n {
+		sp.Rows = append(sp.Rows, embed.Normalize([]int32{0, 1}, []float32{1, 1}))
+	}
+	res := Run(sp, Options{MinK: 6, MaxK: 32, Restarts: 2, MaxIter: 20, Seed: 1})
+	checkTiny(t, "identical", n, res)
+}
+
+// Consensus runs the sweep once and then fixes K for the remaining runs, so it
+// has to cope with the first run coming back degenerate.
+func TestConsensusSurvivesTinyCorpora(t *testing.T) {
+	opt := Options{MinK: 6, MaxK: 32, Restarts: 2, MaxIter: 20, Seed: 1}
+	for _, n := range []int{0, 1, 2, 3} {
+		checkTiny(t, fmt.Sprintf("n=%d", n), n, Consensus(tinySpace(n), opt, 3))
 	}
 }
