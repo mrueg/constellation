@@ -1428,3 +1428,127 @@ func TestBuildCarriesStarsAndDates(t *testing.T) {
 		t.Errorf("similarity = %v, want 0.5", got.Similarity)
 	}
 }
+
+// The plan file is meant to be edited, and every edit that GitHub would refuse
+// or that the tool would misread has to be caught before anything is written.
+// One error names them all, so a plan is fixed in one pass.
+func TestValidateCatchesHandEdits(t *testing.T) {
+	marker := cluster.DescriptionMarker
+	good := func() *Plan {
+		_, _, p := testSetup(t)
+		return p
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(p *Plan)
+		want string // a fragment of the problem reported
+	}{
+		{"empty name", func(p *Plan) { p.Categories[0].Name = "  " }, "name is empty"},
+		{"name too long", func(p *Plan) {
+			p.Categories[0].Name = strings.Repeat("x", cluster.MaxListName+1)
+		}, fmt.Sprintf("%d characters; GitHub allows %d", cluster.MaxListName+1, cluster.MaxListName)},
+		{"description too long", func(p *Plan) {
+			p.Categories[0].Description = strings.Repeat("y", cluster.MaxListDescription+1-len(marker)) + marker
+		}, fmt.Sprintf("GitHub allows %d", cluster.MaxListDescription)},
+		{"marker trimmed", func(p *Plan) { p.Categories[0].Description = "k8s things." }, "recognises the lists it made"},
+		{"names differing only in case", func(p *Plan) { p.Categories[1].Name = "kubernetes" }, "apart from case"},
+		{"repository listed twice", func(p *Plan) {
+			p.Categories[0].Repos = append(p.Categories[0].Repos, Repo{FullName: "Helm/Helm"})
+		}, "listed more than once"},
+		{"repository without owner", func(p *Plan) { p.Categories[0].Repos[0].FullName = "helm" }, "owner/name"},
+		{"repository with an extra slash", func(p *Plan) { p.Categories[0].Repos[0].FullName = "a/b/c" }, "more than one slash"},
+		{"repository with a space", func(p *Plan) { p.Categories[0].Repos[0].FullName = "helm/ helm" }, "whitespace"},
+		{"unassigned entry malformed", func(p *Plan) { p.Unassigned = []Repo{{FullName: "nope"}} }, "unassigned:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := good()
+			tc.edit(p)
+			err := p.Validate()
+			if err == nil {
+				t.Fatal("the edit was accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error does not say %q:\n%v", tc.want, err)
+			}
+		})
+	}
+
+	t.Run("a good plan passes", func(t *testing.T) {
+		p := good()
+		p.Unassigned = []Repo{{FullName: "some/thing"}}
+		if err := p.Validate(); err != nil {
+			t.Errorf("a valid plan was refused: %v", err)
+		}
+	})
+
+	// Runes, not bytes: a name of 32 accented letters is within the limit even
+	// though it is more than 32 bytes long.
+	t.Run("limits are counted in characters", func(t *testing.T) {
+		p := good()
+		p.Categories[0].Name = strings.Repeat("é", cluster.MaxListName)
+		if err := p.Validate(); err != nil {
+			t.Errorf("a name of exactly %d characters was refused: %v", cluster.MaxListName, err)
+		}
+	})
+
+	// An emptied category is how a person drops one without deleting the
+	// entry; Build never writes one and Apply skips one, so it is not a fault.
+	t.Run("an empty category is allowed", func(t *testing.T) {
+		p := good()
+		p.Categories[0].Repos = nil
+		if err := p.Validate(); err != nil {
+			t.Errorf("an empty category was refused: %v", err)
+		}
+	})
+
+	// Every problem in one error, so the user does not fix them one run at a
+	// time.
+	t.Run("all problems are reported together", func(t *testing.T) {
+		p := good()
+		p.Categories[0].Name = ""
+		p.Categories[1].Description = "no marker"
+		p.Categories[1].Repos[0].FullName = "bad"
+		err := p.Validate()
+		if err == nil {
+			t.Fatal("three problems were accepted")
+		}
+		for _, want := range []string{"name is empty", "recognises", "owner/name"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not mention %q:\n%v", want, err)
+			}
+		}
+		if n := strings.Count(err.Error(), "\n"); n != 3 {
+			t.Errorf("want one line per problem (3), got %d:\n%v", n, err)
+		}
+	})
+}
+
+// A too-long name used to fail at CreateList, after --reconcile had already
+// deleted the lists the plan dropped. An invalid plan must now stop before
+// the account is so much as read.
+func TestApplyRefusesAnInvalidPlanBeforeWriting(t *testing.T) {
+	f, c, p := testSetup(t)
+	f.lists = append(f.lists, "Retired")
+	f.described["Retired"] = "Repositories about something. " + cluster.DescriptionMarker
+	f.member["helm/helm"] = []string{f.id("Retired")}
+	p.Categories[1].Name = strings.Repeat("x", cluster.MaxListName+1)
+
+	_, err := Apply(context.Background(), c, p, ApplyOptions{Reconcile: true, Out: io.Discard})
+	if err == nil {
+		t.Fatal("an invalid plan was applied")
+	}
+	if !strings.Contains(err.Error(), "GitHub allows") {
+		t.Errorf("error should name the problem: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.posts != 0 {
+		t.Errorf("an invalid plan sent %d writes", f.posts)
+	}
+	if !contains(f.lists, "Retired") || len(f.lists) != 1 {
+		t.Errorf("lists changed under an invalid plan: %v", f.lists)
+	}
+	if f.listReads != 0 {
+		t.Errorf("the account was read %d times before the plan was checked", f.listReads)
+	}
+}

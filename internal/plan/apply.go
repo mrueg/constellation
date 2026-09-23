@@ -99,6 +99,14 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 	}
 	res := &ApplyResult{}
 
+	// A hand-edited plan is checked in full before the account is even read.
+	// Anything GitHub would refuse — a name over its limit, say — used to
+	// surface at CreateList, after --reconcile had already deleted the lists
+	// the plan dropped.
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+
 	existing, err := c.Lists(ctx)
 	if err != nil {
 		return nil, err
