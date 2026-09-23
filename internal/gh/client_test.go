@@ -2,6 +2,7 @@ package gh
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -116,7 +117,7 @@ func TestRateLimitThatOutlastsTheBudgetIsNamed(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 		fmt.Fprint(w, `{"message":"API rate limit exceeded"}`)
 	}))
-	_, err := c.Readme(context.Background(), "a", "one", 100)
+	_, err := c.Readme(context.Background(), "a", "one", ReadmeLimits{Words: 120, Bytes: 100})
 	if !errors.Is(err, ErrRateLimited) {
 		t.Errorf("Readme under an exhausted quota returned %v, want ErrRateLimited", err)
 	}
@@ -151,7 +152,7 @@ func TestReadmeReportsUnavailableFiles(t *testing.T) {
 			w.WriteHeader(tc.status)
 			fmt.Fprint(w, tc.body)
 		}))
-		text, err := c.Readme(context.Background(), "a", "one", 100)
+		text, err := c.Readme(context.Background(), "a", "one", ReadmeLimits{Words: 120, Bytes: 100})
 		if tc.ok {
 			if err != nil {
 				t.Errorf("%s: %v", tc.name, err)
@@ -184,7 +185,7 @@ func TestReadmeRetriesATransportFailure(t *testing.T) {
 		}
 		fmt.Fprint(w, `{"encoding":"base64","content":"aGVsbG8="}`)
 	}))
-	text, err := c.Readme(context.Background(), "a", "one", 100)
+	text, err := c.Readme(context.Background(), "a", "one", ReadmeLimits{Words: 120, Bytes: 100})
 	if err != nil {
 		t.Fatalf("a dropped connection was not retried: %v (after %d attempts)", err, hits)
 	}
@@ -224,6 +225,33 @@ func TestClassifySecondaryLimitWithoutRetryAfterWaitsAMinute(t *testing.T) {
 	abuse.RetryAfter = &ten
 	if !errors.As(classify(abuse), &after) || after.Duration != 11*time.Second {
 		t.Errorf("classify with Retry-After = %v, want an 11s wait", classify(abuse))
+	}
+}
+
+// The markup is stripped and the opening chosen before the byte cap applies.
+// This README's first 10 KB is badges, a centred HTML header and a table of
+// contents, and the cap is 8 KB: cutting first, as the old code did, left
+// nothing but shields.io URLs to tokenize.
+func TestReadmeStripsBeforeItTruncates(t *testing.T) {
+	fastRetries(t)
+	markdown := badgeWall(10*1024) + "## Overview\n\n" + orbitSummary + "\n\n## Installation\n\n```sh\ngo install github.com/acme/orbit@latest\n```\n"
+	c := testRESTClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString([]byte(markdown)))
+	}))
+	text, err := c.Readme(context.Background(), "a", "one", ReadmeLimits{Words: 120, Bytes: 8192})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Orbit is a lightweight job scheduler") {
+		t.Errorf("the summary past the badges was lost: %q", text)
+	}
+	for _, noise := range []string{"https", "img", "shields", "go install"} {
+		if strings.Contains(text, noise) {
+			t.Errorf("%q reached the tokenizer: %q", noise, text)
+		}
+	}
+	if len(text) > 8192 {
+		t.Errorf("the byte cap was not applied: %d bytes", len(text))
 	}
 }
 
