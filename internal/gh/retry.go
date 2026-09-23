@@ -27,6 +27,14 @@ var (
 	retryInitialInterval = 2 * time.Second
 )
 
+// secondaryRateLimitWait is how long to wait, in seconds, when GitHub reports
+// a secondary rate limit without saying for how long. The documentation says
+// at least a minute, which is far longer than the exponential curve would
+// start at — and retrying sooner is exactly what escalates a secondary limit
+// into a longer ban — so it is stated explicitly rather than left to the
+// backoff. Both the REST and the GraphQL side use it.
+const secondaryRateLimitWait = 60
+
 // waitOut runs an operation, waiting out the rate limits GitHub answers with
 // instead of failing on them.
 //
@@ -71,10 +79,7 @@ func waitOut[T any](ctx context.Context, log func(string, ...any), op func() (T,
 // throttle recognises GitHub asking for a slower pace and turns it into a wait
 // the retry loop honours.
 //
-// Secondary rate limits arrive as 429, or as 403 carrying Retry-After. Without
-// a Retry-After the documentation says to wait at least a minute, which is far
-// longer than the exponential curve would start at, so it is stated explicitly
-// rather than left to the backoff.
+// Secondary rate limits arrive as 429, or as 403 carrying Retry-After.
 func throttle(resp *http.Response) (error, bool) {
 	limited := resp.StatusCode == http.StatusTooManyRequests ||
 		(resp.StatusCode == http.StatusForbidden && resp.Header.Get("Retry-After") != "")
@@ -86,5 +91,5 @@ func throttle(resp *http.Response) (error, bool) {
 			return backoff.RetryAfter(secs + 1), true
 		}
 	}
-	return backoff.RetryAfter(60), true
+	return backoff.RetryAfter(secondaryRateLimitWait), true
 }
