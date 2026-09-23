@@ -193,6 +193,40 @@ func TestReadmeRetriesATransportFailure(t *testing.T) {
 	}
 }
 
+// A secondary rate limit without a Retry-After used to go back on the
+// exponential curve, which starts at two seconds — and hitting the limit again
+// that soon is what escalates it into a longer ban. The documentation's minute
+// applies, and the reason has to survive so the log can say what happened.
+func TestClassifySecondaryLimitWithoutRetryAfterWaitsAMinute(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/user/starred", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abuse := &github.AbuseRateLimitError{
+		Response: &http.Response{StatusCode: http.StatusForbidden, Request: req},
+		Message:  "You have exceeded a secondary rate limit",
+	}
+	got := classify(abuse)
+
+	var after *backoff.RetryAfterError
+	if !errors.As(got, &after) {
+		t.Fatalf("classify = %v, want a RetryAfter", got)
+	}
+	if after.Duration != time.Minute {
+		t.Errorf("wait = %s, want 1m0s", after.Duration)
+	}
+	if !strings.Contains(got.Error(), "secondary rate limit") {
+		t.Errorf("error lost GitHub's reason: %v", got)
+	}
+
+	// With a Retry-After, GitHub's own figure is still what is used.
+	ten := 10 * time.Second
+	abuse.RetryAfter = &ten
+	if !errors.As(classify(abuse), &after) || after.Duration != 11*time.Second {
+		t.Errorf("classify with Retry-After = %v, want an 11s wait", classify(abuse))
+	}
+}
+
 // starPage renders the starred-repositories response for the given ids.
 func starPage(ids []int64) string {
 	items := make([]string, len(ids))

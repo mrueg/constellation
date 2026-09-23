@@ -275,13 +275,19 @@ mutation($listId: ID!) {
 // is re-attempted after GitHub refuses it for being too much work.
 const maxTooLargeRetries = 4
 
+// tooLargeWait is the pause before the attempt after a refusal, growing with
+// each one. It is a variable so tests can shrink it.
+var tooLargeWait = func(attempt int) time.Duration {
+	return time.Duration(attempt+1) * 2 * time.Second
+}
+
 func (c *ListsClient) retryTooLarge(ctx context.Context, op func() error) error {
 	var err error
 	for attempt := range maxTooLargeRetries {
 		if err = op(); !errors.Is(err, errQueryTooLarge) {
 			return err
 		}
-		wait := time.Duration(attempt+1) * 2 * time.Second
+		wait := tooLargeWait(attempt)
 		c.logf("GitHub refused the request as too large, retrying in %s", wait)
 		select {
 		case <-time.After(wait):
@@ -434,7 +440,21 @@ func (c *ListsClient) SetItemListsBatch(ctx context.Context, items []ItemLists) 
 // it asks for is large.
 var errQueryTooLarge = errors.New("graphql query exceeded GitHub's resource limits")
 
+// batchGatewayTries is how many times a batch of several mutations is sent
+// when GitHub answers 502 before it is treated as too large and split. A 502
+// is also what a query that takes too long gets — the refusal that shaped this
+// client's splitting in the first place — and only sometimes carries the
+// "Resource limits" text that names it. Retrying an oversized batch on the
+// full thirty-minute curve sent the identical request twenty times over. One
+// quick retry rules out a passing blip; after that, halving is the cheaper
+// experiment. A single mutation has nothing to split and keeps the full budget.
+const batchGatewayTries = 2
+
 func (c *ListsClient) setItemListsOnce(ctx context.Context, items []ItemLists) (map[string]error, error) {
+	gatewayTries := 0
+	if len(items) > 1 {
+		gatewayTries = batchGatewayTries
+	}
 
 	var decl, body strings.Builder
 	vars := map[string]any{}
@@ -457,8 +477,11 @@ func (c *ListsClient) setItemListsOnce(ctx context.Context, items []ItemLists) (
 	query := fmt.Sprintf("mutation(%s) {\n%s}", decl.String(), body.String())
 
 	var reply map[string]json.RawMessage
-	errs, err := c.queryPartial(ctx, query, vars, &reply)
+	errs, err := c.queryPartialN(ctx, query, vars, &reply, 0, gatewayTries)
 	if err != nil {
+		if gatewayTries > 0 && errors.Is(err, errBadGateway) {
+			return nil, fmt.Errorf("%w: %w", err, errQueryTooLarge)
+		}
 		return nil, err
 	}
 
