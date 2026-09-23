@@ -9,9 +9,28 @@ import (
 
 // cacheFile is the on-disk shape of the star cache.
 type cacheFile struct {
+	// FetchedAt is when the file was last written, by a full walk or a top-up.
 	FetchedAt time.Time `json:"fetched_at"`
-	User      string    `json:"user"`
-	Repos     []Repo    `json:"repos"`
+	// FullFetchedAt is when every page was last read. A top-up reads only the
+	// tail, so this is the age --cache-full-ttl is measured against. Files
+	// written before it existed lack it; see LoadCache.
+	FullFetchedAt time.Time `json:"full_fetched_at,omitzero"`
+	User          string    `json:"user"`
+	Repos         []Repo    `json:"repos"`
+}
+
+// Cache is a loaded star cache.
+type Cache struct {
+	// Repos is nil on a miss.
+	Repos []Repo
+	// FetchedAt is when the cache was last written, whether by a full walk or
+	// a top-up. --cache-ttl is measured against it.
+	FetchedAt time.Time
+	// FullFetchedAt is when the star list was last read in full. A top-up
+	// never revisits the repositories already cached, so a description or
+	// topic changed upstream reaches the model only once this passes
+	// --cache-full-ttl and every page is read again.
+	FullFetchedAt time.Time
 }
 
 // DefaultCachePath returns the per-user cache location.
@@ -23,48 +42,78 @@ func DefaultCachePath() string {
 	return filepath.Join(dir, "constellation", "stars.json")
 }
 
-// SaveCache stores the fetched stars so that re-running with different
-// clustering settings costs no API calls.
+// SaveCache stores the stars of a full walk so that re-running with different
+// clustering settings costs no API calls. Both timestamps are set to now. A
+// top-up, which reads only the tail, goes through TopUpCache instead, so that
+// a read that revisited nothing does not count as a full one.
 //
 // README text is stripped: it lives in its own cache with its own expiry, and
 // writing it here as well would both double the file and tie a megabyte of
 // prose to the star list's one-day lifetime.
 func SaveCache(path, user string, repos []Repo) error {
+	now := time.Now()
+	return writeCache(path, cacheFile{FetchedAt: now, FullFetchedAt: now, User: user, Repos: repos})
+}
+
+// TopUpCache stores a topped-up star list. FetchedAt becomes now, while the
+// full-fetch time is carried over from the cache that was topped up
+// (fullFetchedAt, as LoadCache returned it), since only the pages after the
+// cached tail were read. Stamping both, as SaveCache does, is what kept a
+// cache topped up more often than --cache-full-ttl from ever being re-read in
+// full.
+func TopUpCache(path, user string, repos []Repo, fullFetchedAt time.Time) error {
+	return writeCache(path, cacheFile{FetchedAt: time.Now(), FullFetchedAt: fullFetchedAt, User: user, Repos: repos})
+}
+
+func writeCache(path string, c cacheFile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	bare := make([]Repo, len(repos))
-	copy(bare, repos)
+	bare := make([]Repo, len(c.Repos))
+	copy(bare, c.Repos)
 	for i := range bare {
 		bare[i].Readme = ""
 	}
-	b, err := json.Marshal(cacheFile{FetchedAt: time.Now(), User: user, Repos: bare})
+	c.Repos = bare
+	b, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, b, 0o600)
 }
 
-// LoadCache returns cached stars for the user when they are younger than
+// LoadCache returns the cached stars for the user when they are younger than
 // maxAge; a maxAge of zero or less accepts the cache at any age, which is what
-// an incremental refresh reads it with. A miss is reported as
-// (nil, zero time, nil) rather than an error.
-func LoadCache(path, user string, maxAge time.Duration) ([]Repo, time.Time, error) {
+// an incremental refresh reads it with. A miss — no file, a corrupt one,
+// somebody else's stars — is reported as a Cache with no Repos rather than an
+// error; a cache past maxAge keeps its timestamps, so the caller can say how
+// old it was.
+//
+// A file written before the full-fetch time was recorded has FullFetchedAt
+// taken from FetchedAt. When that cache was last walked in full cannot be
+// known, and treating it as never would force every upgrade into a full
+// re-read; the next full walk records it properly.
+func LoadCache(path, user string, maxAge time.Duration) (Cache, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, time.Time{}, nil
+			return Cache{}, nil
 		}
-		return nil, time.Time{}, err
+		return Cache{}, err
 	}
 	var c cacheFile
 	if err := json.Unmarshal(b, &c); err != nil {
-		return nil, time.Time{}, nil // a corrupt cache is a miss, not a failure
+		return Cache{}, nil // a corrupt cache is a miss, not a failure
 	}
+	if c.FullFetchedAt.IsZero() {
+		c.FullFetchedAt = c.FetchedAt
+	}
+	out := Cache{FetchedAt: c.FetchedAt, FullFetchedAt: c.FullFetchedAt}
 	if c.User != user || (maxAge > 0 && time.Since(c.FetchedAt) > maxAge) {
-		return nil, c.FetchedAt, nil
+		return out, nil
 	}
-	return c.Repos, c.FetchedAt, nil
+	out.Repos = c.Repos
+	return out, nil
 }
 
 // The README cache is deliberately a second file rather than a field of the

@@ -837,15 +837,22 @@ func embedder(f *planFlags) embed.Embedder {
 	}
 }
 
-func loadStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([]gh.Repo, error) {
+// starSource is the part of gh.Client that loadStars reads through, so a test
+// can stand in for GitHub and count which kind of read a cache led to.
+type starSource interface {
+	Starred(ctx context.Context) ([]gh.Repo, error)
+	StarredIncremental(ctx context.Context, cached []gh.Repo) ([]gh.Repo, bool, error)
+}
+
+func loadStars(ctx context.Context, c starSource, user string, f *planFlags) ([]gh.Repo, error) {
 	if !f.refresh {
-		repos, at, err := gh.LoadCache(f.cachePath, user, f.cacheMaxAge)
+		cache, err := gh.LoadCache(f.cachePath, user, f.cacheMaxAge)
 		if err != nil {
 			return nil, err
 		}
-		if len(repos) > 0 {
-			progress("using %d cached stars from %s (--refresh to re-fetch)", len(repos), at.Format(time.RFC822))
-			return repos, nil
+		if len(cache.Repos) > 0 {
+			progress("using %d cached stars from %s (--refresh to re-fetch)", len(cache.Repos), cache.FetchedAt.Format(time.RFC822))
+			return cache.Repos, nil
 		}
 		topped, ok, err := topUpStars(ctx, c, user, f)
 		if err != nil {
@@ -874,16 +881,21 @@ func loadStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([]
 // The cache is still re-read in full once it passes --cache-full-ttl: a
 // topped-up cache never revisits the repositories already in it, so a
 // description rewritten or a topic added upstream would otherwise never reach
-// the model.
-func topUpStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([]gh.Repo, bool, error) {
-	stale, at, err := gh.LoadCache(f.cachePath, user, 0)
-	if err != nil || len(stale) == 0 {
+// the model. That age is measured from the last full walk, not from the last
+// write: a top-up re-stamps the cache without revisiting anything, and
+// measuring from it meant that anyone running the tool more often than the
+// TTL never saw a full re-read at all.
+func topUpStars(ctx context.Context, c starSource, user string, f *planFlags) ([]gh.Repo, bool, error) {
+	cache, err := gh.LoadCache(f.cachePath, user, 0)
+	if err != nil || len(cache.Repos) == 0 {
 		return nil, false, err
 	}
-	if f.cacheFullAge > 0 && time.Since(at) > f.cacheFullAge {
-		progress("the star cache is older than --cache-full-ttl; re-reading every page")
+	if age := time.Since(cache.FullFetchedAt); f.cacheFullAge > 0 && age > f.cacheFullAge {
+		progress("the star list was last read in full on %s, %d days ago, which is past --cache-full-ttl; re-reading every page",
+			cache.FullFetchedAt.Format(time.RFC822), int(age.Hours()/24))
 		return nil, false, nil
 	}
+	stale := cache.Repos
 	merged, ok, err := c.StarredIncremental(ctx, stale)
 	if err != nil {
 		return nil, false, err
@@ -893,8 +905,8 @@ func topUpStars(ctx context.Context, c *gh.Client, user string, f *planFlags) ([
 		return nil, false, nil
 	}
 	progress("topped up %d cached stars from %s: %d now, %d added or removed",
-		len(stale), at.Format(time.RFC822), len(merged), len(merged)-len(stale))
-	if err := gh.SaveCache(f.cachePath, user, merged); err != nil {
+		len(stale), cache.FetchedAt.Format(time.RFC822), len(merged), len(merged)-len(stale))
+	if err := gh.TopUpCache(f.cachePath, user, merged, cache.FullFetchedAt); err != nil {
 		progress("could not write cache: %v", err)
 	}
 	return merged, true, nil

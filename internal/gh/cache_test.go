@@ -2,6 +2,7 @@ package gh
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -108,12 +109,97 @@ func TestSaveCacheDropsReadmeText(t *testing.T) {
 	if strings.Contains(string(b), "distinctive readme opening") {
 		t.Error("the star cache still holds README text")
 	}
-	got, _, err := LoadCache(path, "octocat", time.Hour)
+	got, err := LoadCache(path, "octocat", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].FullName != "a/one" {
-		t.Fatalf("stars did not survive the round trip: %+v", got)
+	if len(got.Repos) != 1 || got.Repos[0].FullName != "a/one" {
+		t.Fatalf("stars did not survive the round trip: %+v", got.Repos)
+	}
+}
+
+// A full walk is the only read that revisits every repository, so it is the
+// only one that may set the full-fetch time. SaveCache records both stamps.
+func TestSaveCacheStampsAFullFetch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stars.json")
+	before := time.Now()
+	if err := SaveCache(path, "octocat", []Repo{{ID: 1, FullName: "a/one"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadCache(path, "octocat", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FetchedAt.Before(before) || got.FullFetchedAt.Before(before) {
+		t.Errorf("a full save stamped fetched %v, full %v; both should be no earlier than %v", got.FetchedAt, got.FullFetchedAt, before)
+	}
+	if !got.FullFetchedAt.Equal(got.FetchedAt) {
+		t.Errorf("a full save stamped fetched %v but full %v; they should agree", got.FetchedAt, got.FullFetchedAt)
+	}
+}
+
+// A top-up reads only the tail of the list, so it advances the cache's age
+// for --cache-ttl but must leave the full-fetch time where the last full walk
+// put it. Stamping both on every save is what kept a cache topped up daily
+// from ever being re-read in full.
+func TestTopUpCacheKeepsTheFullFetchTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stars.json")
+	fullAt := time.Now().Add(-20 * 24 * time.Hour).Truncate(time.Second)
+	writtenAt := fullAt.Add(24 * time.Hour)
+	b, err := json.Marshal(cacheFile{FetchedAt: writtenAt, FullFetchedAt: fullAt, User: "octocat", Repos: []Repo{{ID: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := LoadCache(path, "octocat", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now()
+	if err := TopUpCache(path, "octocat", []Repo{{ID: 1}, {ID: 2}}, stale.FullFetchedAt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadCache(path, "octocat", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 2 {
+		t.Errorf("the topped-up list has %d stars, want 2", len(got.Repos))
+	}
+	if got.FetchedAt.Before(before) {
+		t.Errorf("a top-up left fetched_at at %v; it should have advanced to at least %v", got.FetchedAt, before)
+	}
+	if !got.FullFetchedAt.Equal(fullAt) {
+		t.Errorf("a top-up moved full_fetched_at from %v to %v", fullAt, got.FullFetchedAt)
+	}
+}
+
+// A cache written before the full-fetch time existed carries only fetched_at.
+// When it was last walked in full cannot be known, and reading the missing
+// stamp as "never" would force everyone into a full re-read on upgrade, so it
+// is taken to be the write time; the next full walk records it for real.
+func TestLoadCacheTreatsALegacyFileAsFullyFetchedWhenWritten(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stars.json")
+	fetched := time.Now().Add(-3 * 24 * time.Hour).Truncate(time.Second)
+	legacy := fmt.Sprintf(`{"fetched_at":%q,"user":"octocat","repos":[{"id":1,"full_name":"a/one"}]}`, fetched.Format(time.RFC3339Nano))
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadCache(path, "octocat", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("loaded %d stars, want 1", len(got.Repos))
+	}
+	if !got.FetchedAt.Equal(fetched) {
+		t.Errorf("fetched_at = %v, want %v", got.FetchedAt, fetched)
+	}
+	if !got.FullFetchedAt.Equal(fetched) {
+		t.Errorf("a legacy file loaded with full_fetched_at %v, want fetched_at %v", got.FullFetchedAt, fetched)
 	}
 }
 
