@@ -10,8 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -97,18 +95,12 @@ type Client struct {
 	Log func(format string, args ...any)
 }
 
-// NewClient builds a client from an explicit token, the GITHUB_TOKEN /
-// GH_TOKEN environment variables, or the gh CLI's stored credentials, in that
-// order.
+// NewClient builds a REST client around an already-resolved token; see
+// ResolveToken for where one comes from. Every request this tool makes reads
+// the caller's own account, so there is no unauthenticated mode.
 func NewClient(token string) (*Client, error) {
 	if token == "" {
-		token = firstEnv("GITHUB_TOKEN", "GH_TOKEN")
-	}
-	if token == "" {
-		token = ghCLIToken()
-	}
-	if token == "" {
-		return nil, fmt.Errorf("no GitHub token: set GITHUB_TOKEN, or run `gh auth login`")
+		return nil, errors.New("gh.NewClient: no token given; resolve one with ResolveToken first")
 	}
 	api, err := github.NewClient(
 		github.WithAuthToken(token),
@@ -125,23 +117,6 @@ func (c *Client) logf(format string, args ...any) {
 	if c.Log != nil {
 		c.Log(format, args...)
 	}
-}
-
-// ghCLIToken asks the gh CLI for its stored token.
-//
-// It runs under a deadline because this happens before the signal handler is
-// in play: a gh that hangs — a stuck credential helper, an unreachable
-// keyring — would otherwise hang the whole program with no way to interrupt
-// it. Failing here is not fatal; the caller falls through to reporting that no
-// token was found.
-func ghCLIToken() string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "gh", "auth", "token").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 // Viewer returns the login of the authenticated user.
@@ -447,13 +422,4 @@ func isUnavailable(err error) bool {
 func statusIs(err error, code int) bool {
 	var resp *github.ErrorResponse
 	return errors.As(err, &resp) && resp.Response != nil && resp.Response.StatusCode == code
-}
-
-func firstEnv(names ...string) string {
-	for _, n := range names {
-		if v := strings.TrimSpace(os.Getenv(n)); v != "" {
-			return v
-		}
-	}
-	return ""
 }

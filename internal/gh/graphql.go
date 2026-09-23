@@ -62,16 +62,12 @@ func WithEndpoint(url string) ListsOption {
 	return func(c *ListsClient) { c.endpoint = url }
 }
 
-// NewListsClient resolves a token the same way the REST client does.
+// NewListsClient builds a GraphQL client around an already-resolved token;
+// see ResolveToken for where one comes from. viewer.lists is the caller's own
+// account, so there is no unauthenticated mode.
 func NewListsClient(token string, opts ...ListsOption) (*ListsClient, error) {
 	if token == "" {
-		token = firstEnv("GITHUB_TOKEN", "GH_TOKEN")
-	}
-	if token == "" {
-		token = ghCLIToken()
-	}
-	if token == "" {
-		return nil, fmt.Errorf("no GitHub token: set GITHUB_TOKEN, or run `gh auth login`")
+		return nil, errors.New("gh.NewListsClient: no token given; resolve one with ResolveToken first")
 	}
 	c := &ListsClient{
 		token:    token,
