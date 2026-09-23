@@ -6,8 +6,18 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
 	"github.com/mattn/go-runewidth"
 )
+
+// enabled is the single source of truth for whether colour is applied. It is
+// pushed into every Color in the palette by SetEnabled, so the palette never
+// consults fatih/color's own detection.
+//
+// Until Configure runs it mirrors fatih/color's default (stdout is a terminal,
+// NO_COLOR unset, TERM not dumb), so output looks the same whether or not the
+// caller has configured the package yet.
+var enabled = !color.NoColor
 
 // Configure applies the environment's colour preferences. It is called once
 // from main, rather than from an init function, so that the decision happens at
@@ -15,47 +25,101 @@ import (
 // even in tests that never wanted it, and hides a global mutation in a place
 // nothing calls.
 //
-// Colour is off unless stdout is a terminal, so a redirected plan or a piped
-// log stays free of escape sequences. fatih/color decides that part — it checks
-// the terminal and honours NO_COLOR (https://no-color.org) — and the rules here
-// are the ones it does not cover: CLICOLOR_FORCE for keeping colour through a
-// pager, and TERM=dumb.
-func Configure() {
-	switch {
-	case os.Getenv("NO_COLOR") != "":
-		color.NoColor = true
-	case os.Getenv("CLICOLOR_FORCE") != "":
-		color.NoColor = false
-	case strings.EqualFold(os.Getenv("TERM"), "dumb"):
-		color.NoColor = true
+// The decision is made here rather than left to fatih/color, for two reasons.
+// fatih/color checks only stdout, but main writes warnings and errors to
+// stderr, so `constellation plan 2>err.log` would fill the log with escape
+// sequences. And fatih/color captures NO_COLOR into each Color at construction,
+// which pins colour off for the life of the process and stops SetEnabled from
+// turning it back on; keeping the flag here lets SetEnabled always win.
+//
+// The environment conventions honoured, in order of precedence:
+//
+//   - NO_COLOR set, whatever its value (https://no-color.org): off.
+//   - CLICOLOR_FORCE set to anything but "0" (https://bixense.com/clicolors):
+//     on, even when output is not a terminal — the way to keep colour through
+//     a pager or a CI log that renders it.
+//   - CLICOLOR=0: off.
+//   - TERM=dumb: off.
+//   - Otherwise on only when both stdout and stderr are terminals.
+func Configure() { SetEnabled(detect()) }
+
+func detect() bool {
+	if _, set := os.LookupEnv("NO_COLOR"); set {
+		return false
 	}
+	if v := os.Getenv("CLICOLOR_FORCE"); v != "" && v != "0" {
+		return true
+	}
+	if os.Getenv("CLICOLOR") == "0" {
+		return false
+	}
+	if strings.EqualFold(os.Getenv("TERM"), "dumb") {
+		return false
+	}
+	// Both streams must be terminals. The palette is used on stdout and stderr
+	// alike, and a user who redirects either one expects a file free of escape
+	// sequences; checking stdout alone would colour stderr into a captured
+	// error log, and checking stderr alone would colour a piped plan.
+	return isTerminal(os.Stdout) && isTerminal(os.Stderr)
+}
+
+func isTerminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
 }
 
 // SetEnabled overrides the detection, for tests and for a future --color flag.
-func SetEnabled(v bool) { color.NoColor = !v }
+// It always wins: each Color is switched explicitly, so neither fatih/color's
+// global NoColor nor the NO_COLOR it captured at construction can veto it.
+func SetEnabled(v bool) {
+	enabled = v
+	for _, c := range palette {
+		if v {
+			c.EnableColor()
+		} else {
+			c.DisableColor()
+		}
+	}
+}
 
 // Enabled reports whether colour is being applied.
-func Enabled() bool { return !color.NoColor }
+func Enabled() bool { return enabled }
 
 // The names describe the role rather than the colour, so the palette can change
 // in one place without every call site becoming a lie.
 var (
-	title   = color.New(color.Bold).SprintFunc()
-	added   = color.New(color.FgGreen).SprintFunc()
-	removed = color.New(color.FgRed).SprintFunc()
-	warn    = color.New(color.FgYellow).SprintFunc()
-	muted   = color.New(color.Faint).SprintFunc()
-	name    = color.New(color.FgCyan).SprintFunc()
-	info    = color.New(color.FgBlue).SprintFunc()
+	title   = newColor(color.Bold)
+	added   = newColor(color.FgGreen)
+	removed = newColor(color.FgRed)
+	warn    = newColor(color.FgYellow)
+	muted   = newColor(color.Faint)
+	name    = newColor(color.FgCyan)
+	info    = newColor(color.FgBlue)
+
+	palette = []*color.Color{title, added, removed, warn, muted, name, info}
 )
+
+// newColor builds a Color that follows the package's enabled flag from the
+// start, rather than the NO_COLOR value fatih/color would otherwise pin into it.
+func newColor(attrs ...color.Attribute) *color.Color {
+	c := color.New(attrs...)
+	if enabled {
+		c.EnableColor()
+	} else {
+		c.DisableColor()
+	}
+	return c
+}
 
 // Wrapping an empty string would emit a bare escape pair: no visible text, but
 // it still shifts anything that measures the result.
-func apply(f func(...any) string, s string) string {
+func apply(c *color.Color, s string) string {
 	if s == "" {
 		return s
 	}
-	return f(s)
+	return c.Sprint(s)
 }
 
 // Title is a heading: a category name, a section.
