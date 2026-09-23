@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -312,18 +314,91 @@ func TestShowReadsTheEnvironment(t *testing.T) {
 
 // A README that cannot be read now will not become readable later — over a
 // megabyte, blocked, taken down. Leaving it unmarked made every future run
-// spend a request rediscovering that, forever.
+// spend a request rediscovering that, forever. The client says which failures
+// those are; only they earn the mark.
 func TestPermanentReadmeFailuresAreNotRetriedForever(t *testing.T) {
 	repos := []gh.Repo{{FullName: "a/one"}, {FullName: "b/two"}}
 	f := &planFlags{readmeWorker: 2, readmeBytes: 1000, readmeWords: 50}
 
-	got := fetchReadmes(context.Background(), stubReadmes{err: errors.New("file too large")}, repos, f)
+	err := fmt.Errorf("%w: file too large", gh.ErrReadmeUnavailable)
+	got := fetchReadmes(context.Background(), stubReadmes{err: err}, repos, f)
 	if got != 0 {
 		t.Errorf("fetched %d, want 0", got)
 	}
 	for i := range repos {
 		if repos[i].Readme == "" {
 			t.Errorf("%s was left unmarked, so the next run would try it again", repos[i].FullName)
+		}
+	}
+}
+
+// The opposite mistake is the expensive one. A timeout, a reset or a server
+// error says nothing about the README, yet every failure used to be marked as
+// unreadable and cached for a month: one bad hour poisoned thousands of
+// entries. Those repositories must stay on the list, and the marker must not
+// reach the cache.
+func TestTransientReadmeFailuresStayUnmarked(t *testing.T) {
+	for _, err := range []error{
+		errors.New("dial tcp: i/o timeout"),
+		&url.Error{Op: "Get", URL: "https://api.github.com/repos/a/one/readme", Err: io.ErrUnexpectedEOF},
+	} {
+		repos := []gh.Repo{{FullName: "a/one"}, {FullName: "b/two"}}
+		f := &planFlags{readmeWorker: 2, readmeBytes: 1000, readmeWords: 50}
+
+		if got := fetchReadmes(context.Background(), stubReadmes{err: err}, repos, f); got != 0 {
+			t.Errorf("%v: fetched %d, want 0", err, got)
+		}
+		for i := range repos {
+			if repos[i].Readme != "" {
+				t.Errorf("%v: %s was marked %q, so a passing failure would be cached as permanent", err, repos[i].FullName, repos[i].Readme)
+			}
+		}
+		if changed := harvestReadmes(gh.ReadmeCache{}, repos, time.Now()); changed != 0 {
+			t.Errorf("%v: %d failures reached the cache, want none", err, changed)
+		}
+	}
+}
+
+// countingFailures fails every request the same way and counts them.
+type countingFailures struct {
+	err   error
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingFailures) Readme(context.Context, string, string, int) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return "", c.err
+}
+
+// A rejected token or an exhausted rate limit fails every request from then
+// on, and there is nothing to learn from sending a thousand more. The fetch
+// stops handing out work once it sees one, and none of the repositories it
+// did not reach is marked.
+func TestFatalReadmeFailuresStopTheFetch(t *testing.T) {
+	for _, fatal := range []error{gh.ErrUnauthorized, gh.ErrRateLimited} {
+		repos := make([]gh.Repo, 50)
+		for i := range repos {
+			repos[i].FullName = fmt.Sprintf("owner%d/repo%d", i, i)
+		}
+		const workers = 2
+		f := &planFlags{readmeWorker: workers, readmeBytes: 1000, readmeWords: 50}
+		c := &countingFailures{err: fmt.Errorf("%w: GET /readme: 401", fatal)}
+
+		if got := fetchReadmes(context.Background(), c, repos, f); got != 0 {
+			t.Errorf("%v: fetched %d, want 0", fatal, got)
+		}
+		// Each worker may have had one request in flight when the first
+		// verdict landed; anything beyond that was work knowingly wasted.
+		if c.calls > workers {
+			t.Errorf("%v: %d requests were sent after the first told the whole story, want at most %d", fatal, c.calls, workers)
+		}
+		for i := range repos {
+			if repos[i].Readme != "" {
+				t.Errorf("%v: %s was marked unreadable by a failure that was not about it", fatal, repos[i].FullName)
+			}
 		}
 	}
 }
@@ -403,7 +478,8 @@ func TestUnreadableReadmesAreCached(t *testing.T) {
 	repos := []gh.Repo{{FullName: "a/one"}, {FullName: "b/two"}}
 	f := &planFlags{readmeWorker: 2, readmeBytes: 1000, readmeWords: 50}
 
-	if got := fetchReadmes(context.Background(), stubReadmes{err: errors.New("file too large")}, repos, f); got != 0 {
+	err := fmt.Errorf("%w: file too large", gh.ErrReadmeUnavailable)
+	if got := fetchReadmes(context.Background(), stubReadmes{err: err}, repos, f); got != 0 {
 		t.Fatalf("fetched %d, want 0", got)
 	}
 	cache := gh.ReadmeCache{}
