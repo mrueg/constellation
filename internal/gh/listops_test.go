@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeAPI serves canned GraphQL replies in order, recording what was asked.
@@ -38,6 +41,36 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 func testClient(t *testing.T, f *fakeAPI) *ListsClient {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(srv.Close)
+	c, err := NewListsClient("token", WithHTTPClient(srv.Client()), WithEndpoint(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// shrinkWaits makes every pause the package takes negligible for the rest of
+// the test, so a test that exercises a retry does not sit through the real
+// schedule. The production values are what the package variables default to.
+func shrinkWaits(t *testing.T) {
+	t.Helper()
+	initial, large := retryInitialInterval, tooLargeWait
+	maxWait, fallback := maxRateLimitWait, rateLimitFallbackWait
+	retryInitialInterval = time.Millisecond
+	tooLargeWait = func(int) time.Duration { return time.Millisecond }
+	maxRateLimitWait = time.Millisecond
+	rateLimitFallbackWait = time.Millisecond
+	t.Cleanup(func() {
+		retryInitialInterval, tooLargeWait = initial, large
+		maxRateLimitWait, rateLimitFallbackWait = maxWait, fallback
+	})
+}
+
+// graphqlServer is a hand-rolled fake for the cases fakeAPI cannot express:
+// a status code or headers chosen per request.
+func graphqlServer(t *testing.T, h http.HandlerFunc) *ListsClient {
+	t.Helper()
+	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	c, err := NewListsClient("token", WithHTTPClient(srv.Client()), WithEndpoint(srv.URL))
 	if err != nil {
@@ -274,26 +307,231 @@ func TestRateLimitedGivesUpEventually(t *testing.T) {
 // and it is exactly the failure that shaped this client's query splitting, so
 // it must be retried rather than ending the run.
 func TestServerErrorsAreRetried(t *testing.T) {
+	shrinkWaits(t)
 	var hits int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := graphqlServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		hits++
 		if hits == 1 {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		_, _ = io.WriteString(w, `{"data":{"viewer":{"login":"octocat"}}}`)
-	}))
-	t.Cleanup(srv.Close)
-	c, err := NewListsClient("token", WithHTTPClient(srv.Client()), WithEndpoint(srv.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
+	})
+	var logged []string
+	c.Log = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+
 	login, err := c.Login(context.Background())
 	if err != nil {
 		t.Fatalf("a 502 was not retried: %v", err)
 	}
 	if login != "octocat" || hits != 2 {
 		t.Errorf("login=%q after %d attempts", login, hits)
+	}
+	// The retry line used to say "rate limited" whatever the cause; a 502
+	// must be reported as what it is.
+	if len(logged) != 1 || !strings.Contains(logged[0], "502") {
+		t.Errorf("retry log %q does not say what was retried", logged)
+	}
+}
+
+// A batch of several mutations that GitHub answers with 502 is most likely too
+// much work for one request — the same refusal as "Resource limits", without
+// the text. Retrying it on the full curve sent the identical request twenty
+// times over half an hour; instead it is tried again once and then split.
+func TestOversizedBatchOn502IsSplit(t *testing.T) {
+	shrinkWaits(t)
+	var hits int
+	c := graphqlServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		body, _ := io.ReadAll(r.Body)
+		// Anything bigger than a pair is "too large".
+		if strings.Count(string(body), "updateUserListsForItem") > 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"m0":{"item":{"__typename":"Repository"}},"m1":{"item":{"__typename":"Repository"}}}}`)
+	})
+
+	items := []ItemLists{
+		{RepoID: "R1", ListIDs: []string{"L1"}, Name: "a/one"},
+		{RepoID: "R2", ListIDs: []string{"L1"}, Name: "b/two"},
+		{RepoID: "R3", ListIDs: []string{"L1"}, Name: "c/three"},
+		{RepoID: "R4", ListIDs: []string{"L1"}, Name: "d/four"},
+	}
+	failed, err := c.SetItemListsBatch(context.Background(), items)
+	if err != nil {
+		t.Fatalf("a batch refused with 502 was not split: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Errorf("split batches reported failures: %v", failed)
+	}
+	// The full batch twice, then each half once.
+	if hits != batchGatewayTries+2 {
+		t.Errorf("made %d requests, want %d (the batch %d times, then two halves)", hits, batchGatewayTries+2, batchGatewayTries)
+	}
+}
+
+// The short budget is for 502 alone: any other failure on a batch — GitHub
+// being unwell, a secondary limit — is waited out as before, because splitting
+// would not help with it and giving up would fail the apply.
+func TestBatchStillRidesOutOtherServerErrors(t *testing.T) {
+	shrinkWaits(t)
+	var hits int
+	c := graphqlServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits <= batchGatewayTries+1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"m0":{"item":{"__typename":"Repository"}},"m1":{"item":{"__typename":"Repository"}}}}`)
+	})
+	items := []ItemLists{
+		{RepoID: "R1", ListIDs: []string{"L1"}, Name: "a/one"},
+		{RepoID: "R2", ListIDs: []string{"L1"}, Name: "b/two"},
+	}
+	if _, err := c.SetItemListsBatch(context.Background(), items); err != nil {
+		t.Fatalf("a batch gave up on a 500: %v", err)
+	}
+	if hits != batchGatewayTries+2 {
+		t.Errorf("made %d requests, want %d (the same batch until it went through)", hits, batchGatewayTries+2)
+	}
+}
+
+// A single mutation has nothing to split, so a 502 on it keeps the ordinary
+// retry budget rather than the short one a batch gets.
+func TestSingleMutationOn502IsRetried(t *testing.T) {
+	shrinkWaits(t)
+	var hits int
+	c := graphqlServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits <= batchGatewayTries {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"m0":{"item":{"__typename":"Repository"}}}}`)
+	})
+	one := []ItemLists{{RepoID: "R1", ListIDs: []string{"L1"}, Name: "a/one"}}
+	if _, err := c.SetItemListsBatch(context.Background(), one); err != nil {
+		t.Fatalf("a single mutation gave up on 502: %v", err)
+	}
+	if hits != batchGatewayTries+1 {
+		t.Errorf("made %d requests, want %d", hits, batchGatewayTries+1)
+	}
+	// And the plain single-item call, which does not go through the batch
+	// path at all.
+	hits = 0
+	if err := c.SetItemLists(context.Background(), "R1", []string{"L1"}); err != nil {
+		t.Fatalf("SetItemLists gave up on 502: %v", err)
+	}
+	if hits != batchGatewayTries+1 {
+		t.Errorf("made %d requests, want %d", hits, batchGatewayTries+1)
+	}
+}
+
+// A rate-limited reply says when the budget comes back. The old fixed minute
+// almost never reached it — the window is an hour — so five waits in a row
+// ended in an error after five wasted minutes.
+func TestRateLimitedWaitsForTheReset(t *testing.T) {
+	shrinkWaits(t)
+	// The header names a reset seconds away; the cap keeps the test short and
+	// the zero fallback makes an ignored header show up as no wait at all.
+	const wait = 50 * time.Millisecond
+	maxRateLimitWait, rateLimitFallbackWait = wait, 0
+
+	var hits int
+	c := graphqlServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits == 1 {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(3*time.Second).Unix(), 10))
+			_, _ = io.WriteString(w, `{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"viewer":{"login":"octocat"}}}`)
+	})
+	var logged []string
+	c.Log = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+
+	start := time.Now()
+	login, err := c.Login(context.Background())
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("a rate-limited reply was not waited out: %v", err)
+	}
+	if login != "octocat" || hits != 2 {
+		t.Errorf("login=%q after %d requests, want octocat after 2", login, hits)
+	}
+	if elapsed < wait {
+		t.Errorf("returned after %s, want at least the %s the reset header asked for", elapsed, wait)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "rate limit") {
+		t.Errorf("expected one log line naming the wait, got %q", logged)
+	}
+}
+
+// Without any header there is nothing to go on, and a minute is the fallback.
+func TestRateLimitedFallsBackToAMinute(t *testing.T) {
+	if rateLimitFallbackWait != time.Minute {
+		t.Errorf("fallback wait is %s, want 1m0s", rateLimitFallbackWait)
+	}
+	shrinkWaits(t)
+	const wait = 50 * time.Millisecond
+	maxRateLimitWait, rateLimitFallbackWait = time.Hour, wait
+
+	var hits int
+	c := graphqlServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits == 1 {
+			_, _ = io.WriteString(w, `{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"viewer":{"login":"octocat"}}}`)
+	})
+	start := time.Now()
+	if _, err := c.Login(context.Background()); err != nil {
+		t.Fatalf("a rate-limited reply was not waited out: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < wait {
+		t.Errorf("returned after %s, want at least the %s fallback", elapsed, wait)
+	}
+	if hits != 2 {
+		t.Errorf("made %d requests, want 2", hits)
+	}
+}
+
+// The wait is read from the headers GitHub sends with a 200: Retry-After when
+// present, in seconds or as an HTTP date, and X-RateLimit-Reset otherwise.
+func TestRateLimitWaitReadsHeaders(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	h := func(kv ...string) http.Header {
+		out := http.Header{}
+		for i := 0; i+1 < len(kv); i += 2 {
+			out.Set(kv[i], kv[i+1])
+		}
+		return out
+	}
+	cases := []struct {
+		name string
+		h    http.Header
+		want time.Duration
+		ok   bool
+	}{
+		{"reset epoch", h("X-RateLimit-Reset", strconv.FormatInt(now.Add(5*time.Second).Unix(), 10)), 6 * time.Second, true},
+		{"retry-after seconds", h("Retry-After", "7"), 8 * time.Second, true},
+		{"retry-after http date", h("Retry-After", now.Add(10*time.Second).Format(http.TimeFormat)), 11 * time.Second, true},
+		{"retry-after wins over reset", h("Retry-After", "7", "X-RateLimit-Reset", strconv.FormatInt(now.Add(time.Hour).Unix(), 10)), 8 * time.Second, true},
+		{"reset in the past", h("X-RateLimit-Reset", strconv.FormatInt(now.Add(-time.Second).Unix(), 10)), 0, false},
+		{"garbage", h("Retry-After", "soon", "X-RateLimit-Reset", "later"), 0, false},
+		{"nothing", h(), 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := rateLimitWait(tc.h, now)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("%s: rateLimitWait = (%s, %v), want (%s, %v)", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+	if maxRateLimitWait != 65*time.Minute {
+		t.Errorf("maxRateLimitWait = %s, want 65m0s", maxRateLimitWait)
 	}
 }
 
@@ -368,6 +606,7 @@ func TestBatchAttributesPerItemFailures(t *testing.T) {
 // write there is nothing to split, so the only remedy is to ask again — and a
 // failed deletion leaves the account over its list cap, which aborts the run.
 func TestDeleteListRetriesWhenRefusedAsTooLarge(t *testing.T) {
+	shrinkWaits(t)
 	f := &fakeAPI{replies: []string{
 		`{"errors":[{"message":"Resource limits for this query exceeded."}]}`,
 		`{"data":{"deleteUserList":{"user":{"id":"u"}}}}`,

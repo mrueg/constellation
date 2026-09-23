@@ -342,7 +342,12 @@ func classify(err error) error {
 		if d := abuse.GetRetryAfter(); d > 0 {
 			return fmt.Errorf("%w: %w", backoff.RetryAfter(int(d.Seconds())+1), err)
 		}
-		return err
+		// No Retry-After: returning the bare error put this on the
+		// exponential curve, which starts at two seconds — and hitting a
+		// secondary limit again that soon is what turns it into a longer
+		// ban. The retry loop finds the RetryAfter through errors.As, so
+		// the reason can stay wrapped and reach the log.
+		return fmt.Errorf("%w: %w", err, backoff.RetryAfter(secondaryRateLimitWait))
 	}
 	var limit *github.RateLimitError
 	if errors.As(err, &limit) {
