@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
 	"path"
@@ -655,8 +656,22 @@ func extendPlan(ctx context.Context, lists *gh.ListsClient, user string, repos [
 			p.Categories[i].Description = d
 		}
 	}
-	p.Settings = f.settings()
+	// The categories were produced by the previous run's settings, not this
+	// one's: the clustering flags on this command line did nothing, so
+	// recording them would misdescribe the plan. The previous settings are
+	// carried forward and the pass itself is recorded separately, along with
+	// the only knobs that took part in it.
+	p.Settings = maps.Clone(prev.Settings)
+	if p.Settings == nil {
+		p.Settings = map[string]string{}
+	}
 	p.Settings["incremental"] = "true"
+	p.Settings["incremental-from"] = prev.GeneratedAt.UTC().Format(time.RFC3339)
+	num := func(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }
+	p.Settings["place-min-similarity"] = num(f.minSimilarity)
+	p.Settings["place-outlier-sigmas"] = num(f.outlierSigmas)
+	p.Settings["place-multi-list"] = strconv.Itoa(f.multiList)
+	p.Settings["place-multi-list-ratio"] = num(f.multiRatio)
 	warnListBudget(p, existing)
 	return p, nil
 }
@@ -686,37 +701,75 @@ func warnListBudget(p *plan.Plan, existing []gh.List) {
 	}
 }
 
-// settings records the tuning that produced a plan. Only the knobs that change
-// the categories are kept: cache paths, worker counts and output paths say
-// nothing about why the plan looks the way it does.
+// settings records the tuning that produced a plan: every knob that changes
+// which stars take part, how they are embedded, how they are clustered and how
+// they are placed. Cache paths, worker counts and output paths say nothing
+// about why the plan looks the way it does and are left out; the list of
+// those is kept in the test that checks every flag lands in one place or the
+// other, so a new flag cannot go unrecorded by accident.
+//
+// Keys are the flag names. Values are the flag values in their command-line
+// form, so a plan can be reproduced by reading them straight back.
 func (f *planFlags) settings() map[string]string {
 	num := func(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }
 	return map[string]string{
-		"algorithm":             f.algorithm,
-		"weighting":             f.weighting,
-		"lsa-dims":              strconv.Itoa(f.lsaDims),
-		"lsa-seed":              strconv.FormatInt(f.lsaSeed, 10),
-		"min-df":                strconv.Itoa(f.minDF),
-		"max-df":                num(f.maxDFRatio),
-		"max-vocab":             strconv.Itoa(f.maxVocab),
-		"max-clusters":          strconv.Itoa(f.maxK),
-		"min-clusters":          strconv.Itoa(f.minK),
-		"clusters":              strconv.Itoa(f.clusters),
-		"min-size":              strconv.Itoa(f.minSize),
-		"min-cohesion":          num(f.minCohesion),
-		"min-name-coverage":     num(f.minCoverage),
-		"merge-duplicates":      num(f.mergeOverlap),
-		"split-parts":           strconv.Itoa(f.splitParts),
-		"rescue-neighbours":     strconv.Itoa(f.rescueK),
-		"rescue-agreement":      num(f.rescueAgree),
-		"multi-list":            strconv.Itoa(f.multiList),
+		// Which stars take part.
+		"include-forks":    strconv.FormatBool(f.includeForks),
+		"include-archived": strconv.FormatBool(f.includeArchived),
+		"min-stars":        strconv.Itoa(f.minStars),
+		"starred-after":    f.starredAfter,
+		"exclude":          strings.Join(f.exclude, ","),
+
+		// What text represents each repository, and how it is weighted.
+		"readme":                strconv.FormatBool(f.withReadme),
+		"readme-bytes":          strconv.Itoa(f.readmeBytes),
+		"readme-words":          strconv.Itoa(f.readmeWords),
+		"readme-weight":         num(f.readmeWeight),
 		"language-weight":       num(f.langWeight),
 		"topic-weight":          num(f.topicWeight),
 		"topic-word-weight":     num(f.topicWordW),
 		"topic-inferred-weight": num(f.topicInferred),
-		"readme-weight":         num(f.readmeWeight),
-		"readme-words":          strconv.Itoa(f.readmeWords),
-		"consensus":             strconv.Itoa(f.consensus),
+		"topic-min-count":       strconv.Itoa(f.topicMinCount),
+
+		// The embedding.
+		"weighting":      f.weighting,
+		"bm25-k1":        num(f.bm25K1),
+		"bm25-b":         num(f.bm25B),
+		"min-df":         strconv.Itoa(f.minDF),
+		"max-df":         num(f.maxDFRatio),
+		"max-vocab":      strconv.Itoa(f.maxVocab),
+		"lsa-dims":       strconv.Itoa(f.lsaDims),
+		"lsa-seed":       strconv.FormatInt(f.lsaSeed, 10),
+		"lsa-oversample": strconv.Itoa(f.lsaOversample),
+		"lsa-power":      strconv.Itoa(f.lsaPower),
+
+		// The clustering.
+		"algorithm":         f.algorithm,
+		"clusters":          strconv.Itoa(f.clusters),
+		"min-clusters":      strconv.Itoa(f.minK),
+		"max-clusters":      strconv.Itoa(f.maxK),
+		"consensus":         strconv.Itoa(f.consensus),
+		"restarts":          strconv.Itoa(f.restarts),
+		"seed":              strconv.FormatInt(f.seed, 10),
+		"silhouette-sample": strconv.Itoa(f.sample),
+
+		// The refinement.
+		"min-size":          strconv.Itoa(f.minSize),
+		"max-lists":         strconv.Itoa(f.maxLists),
+		"min-cohesion":      num(f.minCohesion),
+		"min-name-coverage": num(f.minCoverage),
+		"merge-duplicates":  num(f.mergeOverlap),
+		"split-parts":       strconv.Itoa(f.splitParts),
+		"split-min-size":    strconv.Itoa(f.splitMinSize),
+		"split-max-size":    strconv.Itoa(f.splitMaxSize),
+		"rescue-neighbours": strconv.Itoa(f.rescueK),
+		"rescue-agreement":  num(f.rescueAgree),
+
+		// The placement.
+		"min-similarity":   num(f.minSimilarity),
+		"outlier-sigmas":   num(f.outlierSigmas),
+		"multi-list":       strconv.Itoa(f.multiList),
+		"multi-list-ratio": num(f.multiRatio),
 	}
 }
 

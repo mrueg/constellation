@@ -404,7 +404,10 @@ different space would compare two things that are not comparable. That costs
 CPU, not API calls. A repository the plan already left uncategorized stays
 uncategorized — reconsidering it would make an incremental run quietly differ
 from the run that produced the plan — and one you have since unstarred drops
-out. The plan records `incremental: true` in its settings.
+out. The plan keeps the settings of the run that built its categories — the
+clustering flags on an incremental command line do nothing, so they are not
+recorded — and adds `incremental: true`, `incremental-from` (when the plan it
+extended was written) and the placement knobs under `place-` keys.
 
 With no plan at `--out` yet, `--incremental` plans from scratch and says so.
 
