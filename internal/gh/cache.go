@@ -94,9 +94,14 @@ type readmeFile struct {
 	Entries ReadmeCache `json:"entries"`
 }
 
-// readmeCacheVersion guards the file against a future change of shape. A
+// readmeCacheVersion guards the file against a change of shape or meaning. A
 // mismatch is treated as a miss, which costs a re-fetch and no correctness.
-const readmeCacheVersion = 1
+//
+// Version 1 held the first bytes of each README, stripped and collapsed.
+// Version 2 holds the README's opening summary, chosen by section before
+// anything is cut; the old text cannot be re-read into that shape, so the
+// first run after the upgrade fetches every README again.
+const readmeCacheVersion = 2
 
 // DefaultReadmeCachePath returns the per-user README cache location.
 func DefaultReadmeCachePath() string {

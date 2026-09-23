@@ -205,7 +205,7 @@ type stubReadmes struct {
 	err  error
 }
 
-func (s stubReadmes) Readme(ctx context.Context, owner, repo string, limit int) (string, error) {
+func (s stubReadmes) Readme(ctx context.Context, _, _ string, _ gh.ReadmeLimits) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -331,7 +331,7 @@ type countingFailures struct {
 	calls int
 }
 
-func (c *countingFailures) Readme(context.Context, string, string, int) (string, error) {
+func (c *countingFailures) Readme(context.Context, string, string, gh.ReadmeLimits) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls++
@@ -392,7 +392,7 @@ type countingReadmes struct {
 	mu    sync.Mutex
 }
 
-func (c *countingReadmes) Readme(_ context.Context, _, _ string, _ int) (string, error) {
+func (c *countingReadmes) Readme(_ context.Context, _, _ string, _ gh.ReadmeLimits) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls++
