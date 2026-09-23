@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/mrueg/constellation/internal/embed"
@@ -458,5 +459,88 @@ func TestConsensusSurvivesTinyCorpora(t *testing.T) {
 	opt := Options{MinK: 6, MaxK: 32, Restarts: 2, MaxIter: 20, Seed: 1}
 	for _, n := range []int{0, 1, 2, 3} {
 		checkTiny(t, fmt.Sprintf("n=%d", n), n, Consensus(tinySpace(n), opt, 3))
+	}
+}
+
+// cancelCorpus is a corpus large enough that a full k-means search over it
+// takes far longer than the tests below allow, so that only a cancel that is
+// actually honoured lets them finish.
+func cancelCorpus(n, dim int) *embed.Space {
+	r := rand.New(rand.NewSource(11))
+	sp := &embed.Space{Dim: dim}
+	for range n {
+		idx := make([]int32, dim)
+		val := make([]float32, dim)
+		for k := range dim {
+			idx[k], val[k] = int32(k), float32(r.NormFloat64())
+		}
+		sp.Rows = append(sp.Rows, embed.Normalize(idx, val))
+	}
+	return sp
+}
+
+// The k-means search is restarts times K candidates times iterations, each a
+// pass over the corpus. A cancelled context has to stop it rather than run to
+// completion. The result is discarded by the caller, so all that matters is
+// that it comes back promptly and well-formed.
+func TestRunStopsOnCancel(t *testing.T) {
+	sp := cancelCorpus(400, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled: every loop must bail on its first check
+
+	res := RunContext(ctx, sp, Options{MinK: 2, MaxK: 40, Restarts: 50, MaxIter: 100, Seed: 1})
+	checkTiny(t, "cancelled", len(sp.Rows), res)
+	// No Lloyd iteration ran, so nothing was ever assigned, and the sweep
+	// stopped at its first candidate. Either would be a sign that a loop
+	// carried on past the cancel.
+	if res.K != 2 {
+		t.Errorf("K = %d after a cancel, want the sweep to stop at the first candidate", res.K)
+	}
+	for i, c := range res.Assign {
+		if c != -1 {
+			t.Fatalf("row %d was assigned to %d, so an iteration ran on a cancelled context", i, c)
+		}
+	}
+}
+
+// Consensus is --consensus full searches in a row, so it is where an interrupt
+// is most needed. An already-cancelled context must come back from the first
+// run without starting the rest.
+func TestConsensusStopsOnCancel(t *testing.T) {
+	sp := cancelCorpus(400, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res := ConsensusContext(ctx, sp, Options{MinK: 2, MaxK: 40, Restarts: 50, MaxIter: 100, Seed: 1}, 20)
+	checkTiny(t, "cancelled", len(sp.Rows), res)
+	for i, c := range res.Assign {
+		if c != -1 {
+			t.Fatalf("row %d was assigned to %d, so an iteration ran on a cancelled context", i, c)
+		}
+	}
+}
+
+// A cancel that arrives while the search is running has to be noticed from
+// inside the loops, not only at their start. The corpus and search are sized
+// so that a full run takes minutes; the deadline is a fraction of a second.
+func TestConsensusStopsOnCancelMidRun(t *testing.T) {
+	sp := cancelCorpus(2000, 64)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	res := ConsensusContext(ctx, sp, Options{
+		MinK: 2, MaxK: 40, Restarts: 20, MaxIter: 200, Seed: 1, SilhouetteSample: 50,
+	}, 20)
+	elapsed := time.Since(start)
+
+	checkTiny(t, "mid-run", len(sp.Rows), res)
+	if ctx.Err() == nil {
+		t.Fatal("the search finished before the deadline; it is not large enough to test a mid-run cancel")
+	}
+	// Generous next to the deadline, so that a slow or contended machine
+	// does not fail it, and still a small fraction of the uncancelled run.
+	if elapsed > 5*time.Second {
+		t.Fatalf("took %v to return after a 100ms deadline", elapsed)
 	}
 }

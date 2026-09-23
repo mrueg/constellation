@@ -39,6 +39,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// NotifyContext keeps the signals captured until stop runs, so a second
+	// Ctrl-C while the first is still unwinding would be swallowed; releasing
+	// them as soon as ctx is cancelled lets it reach the default handler and
+	// kill the process at once.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	if err := command().Run(ctx, os.Args); err != nil {
 		switch {
@@ -546,7 +554,7 @@ func buildPlan(ctx context.Context, lists *gh.ListsClient, user string, repos []
 	var res *cluster.Result
 	switch f.algorithm {
 	case "kmeans":
-		res = cluster.Consensus(sp, base, f.consensus)
+		res = cluster.ConsensusContext(ctx, sp, base, f.consensus)
 	case "agglomerative":
 		// Nothing here is seeded, so the cluster count cannot be chosen by the
 		// silhouette sweep either; the tree is cut at the list cap and the

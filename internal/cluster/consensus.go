@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"sort"
 
 	"github.com/mrueg/constellation/internal/embed"
@@ -26,23 +27,37 @@ import (
 // repository, which is what makes it affordable on a corpus this size; a full
 // co-association matrix would be seventeen million entries.
 func Consensus(sp *embed.Space, opt Options, runs int) *Result {
+	return ConsensusContext(context.Background(), sp, opt, runs)
+}
+
+// ConsensusContext is Consensus that stops when ctx is cancelled. It is
+// --consensus times as long as a single run, so it is where an interrupt is
+// most needed. On cancellation it hands back whatever the run in progress
+// had built — never nil, see RunContext — rather than an agreement between
+// partial runs, which would describe nothing; the caller discards it after
+// seeing ctx.Err().
+func ConsensusContext(ctx context.Context, sp *embed.Space, opt Options, runs int) *Result {
 	if runs < 2 || len(sp.Rows) == 0 {
-		return Run(sp, opt)
+		return RunContext(ctx, sp, opt)
 	}
 
 	// How many categories there are is settled once. Repeating the silhouette
 	// sweep for every run would spend most of the time re-deriving the same
 	// answer, and it is the starting point that is being varied here, not the
 	// number of clusters.
-	first := Run(sp, opt)
-	if first.K == 0 {
+	first := RunContext(ctx, sp, opt)
+	if first.K == 0 || ctx.Err() != nil {
 		return first
 	}
 	parts := []*Result{first}
 	for i := 1; i < runs; i++ {
 		o := withK(opt, first.K)
 		o.Seed = opt.Seed + int64(i)*7919
-		if res := Run(sp, o); res.K > 0 {
+		res := RunContext(ctx, sp, o)
+		if ctx.Err() != nil {
+			return res
+		}
+		if res.K > 0 {
 			parts = append(parts, res)
 		}
 	}
@@ -53,7 +68,10 @@ func Consensus(sp *embed.Space, opt Options, runs int) *Result {
 		return parts[0]
 	}
 
-	consensus := Run(indicatorSpace(parts, len(sp.Rows)), withK(opt, first.K))
+	consensus := RunContext(ctx, indicatorSpace(parts, len(sp.Rows)), withK(opt, first.K))
+	if ctx.Err() != nil {
+		return consensus
+	}
 
 	// The agreement space says which repositories belong together, but every
 	// measurement downstream — cohesion, outlier rejection, the order within a
