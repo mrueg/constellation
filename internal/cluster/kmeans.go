@@ -2,6 +2,7 @@
 package cluster
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"sort"
@@ -67,6 +68,26 @@ type Options struct {
 // Run clusters the space, choosing K by sampled silhouette score when
 // Options.K is zero.
 func Run(sp *embed.Space, opt Options) *Result {
+	return RunContext(context.Background(), sp, opt)
+}
+
+// RunContext is Run that stops when ctx is cancelled.
+//
+// The search is restarts times K candidates times Lloyd iterations, each of
+// them a pass over every repository, so a large corpus spends minutes here;
+// without a check a Ctrl-C during clustering did nothing until it finished.
+// The context is looked at between K candidates, between restarts and once
+// per Lloyd iteration — each of those is a full O(n·k·dim) pass, so the check
+// costs nothing measurable.
+//
+// On cancellation it returns what it has built so far, never nil: the best
+// completed restart if there is one, otherwise the partial run it was in the
+// middle of, which may still have every repository unassigned. The caller
+// discards it after seeing ctx.Err(); the point is to stop wasting CPU, not to
+// produce a usable answer. Returning nil instead would make every caller —
+// Consensus, the refinement, the tests — guard against a case that only
+// exists to be thrown away.
+func RunContext(ctx context.Context, sp *embed.Space, opt Options) *Result {
 	n := len(sp.Rows)
 	if n == 0 {
 		return &Result{}
@@ -75,7 +96,7 @@ func Run(sp *embed.Space, opt Options) *Result {
 	// extra centroids can only ever be empty, and the silhouette has nothing
 	// to say about a partition of singletons.
 	if opt.K > 0 {
-		return best(sp, min(opt.K, n), opt)
+		return best(ctx, sp, min(opt.K, n), opt)
 	}
 
 	minK, maxK := opt.MinK, opt.MaxK
@@ -92,7 +113,17 @@ func Run(sp *embed.Space, opt Options) *Result {
 	var bestRes *Result
 	bestSil := math.Inf(-1)
 	for k := minK; k <= maxK; k += kStep(minK, maxK) {
-		r := best(sp, k, opt)
+		r := best(ctx, sp, k, opt)
+		// The silhouette is quadratic in the sample and is not itself
+		// interruptible, so it is skipped for a run that was cut short; the
+		// result is being thrown away anyway. The smallest K is still handed
+		// back so that a cancelled sweep returns a well-formed Result.
+		if ctx.Err() != nil {
+			if bestRes == nil {
+				bestRes = r
+			}
+			break
+		}
 		sil := silhouette(sp, r, sample)
 		if math.IsNaN(sil) {
 			sil = math.Inf(-1)
@@ -118,14 +149,19 @@ func kStep(minK, maxK int) int {
 	return int(math.Ceil(float64(span) / maxCandidates))
 }
 
-func best(sp *embed.Space, k int, opt Options) *Result {
+func best(ctx context.Context, sp *embed.Space, k int, opt Options) *Result {
 	restarts := opt.Restarts
 	if restarts < 1 {
 		restarts = 1
 	}
 	var out *Result
 	for r := 0; r < restarts; r++ {
-		res := kmeans(sp, k, opt, opt.Seed+int64(r)*7919+int64(k)*104729)
+		// The first restart always runs so that there is something to hand
+		// back; it bails at its own first check, before any iteration.
+		if out != nil && ctx.Err() != nil {
+			break
+		}
+		res := kmeans(ctx, sp, k, opt, opt.Seed+int64(r)*7919+int64(k)*104729)
 		if out == nil || res.Score > out.Score {
 			out = res
 		}
@@ -133,7 +169,7 @@ func best(sp *embed.Space, k int, opt Options) *Result {
 	return out
 }
 
-func kmeans(sp *embed.Space, k int, opt Options, seed int64) *Result {
+func kmeans(ctx context.Context, sp *embed.Space, k int, opt Options, seed int64) *Result {
 	n := len(sp.Rows)
 	rng := rand.New(rand.NewSource(seed))
 	centroids := kmeansPlusPlus(sp, k, rng)
@@ -148,6 +184,12 @@ func kmeans(sp *embed.Space, k int, opt Options, seed int64) *Result {
 	}
 	score := 0.0
 	for iter := 0; iter < maxIter; iter++ {
+		// One check per iteration: an iteration is a pass over every
+		// repository against every centroid, so the check is free and a
+		// cancel is noticed within one pass.
+		if ctx.Err() != nil {
+			break
+		}
 		changed := false
 		score = 0
 		for i, row := range sp.Rows {
