@@ -6,14 +6,38 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff/v5"
 	"github.com/google/go-github/v90/github"
+)
+
+// Errors a caller can act on. Each wraps the error GitHub answered with, so
+// errors.Is finds the sentinel and the message still says what happened.
+var (
+	// ErrReadmeUnavailable means a README cannot be read and will not become
+	// readable soon: it is over the size the API serves, blocked, or taken
+	// down. A caller may remember that verdict; every other failure is
+	// worth asking about again.
+	ErrReadmeUnavailable = errors.New("readme unavailable")
+
+	// ErrRateLimited means the primary rate limit is exhausted and its reset
+	// is further away than the retry budget, so waiting was not an option.
+	// Nothing else will succeed until the window resets, and a caller with
+	// thousands of requests queued should stop rather than fail each one.
+	ErrRateLimited = errors.New("rate limit exhausted")
+
+	// ErrUnauthorized means GitHub rejected the token. A token that has
+	// expired mid-run fails every request from then on in the same way.
+	ErrUnauthorized = errors.New("token rejected")
 )
 
 // Repo is the subset of a starred repository that the categorizer reads. It is
@@ -240,6 +264,12 @@ func (c *Client) StarredIncremental(ctx context.Context, cached []Repo) ([]Repo,
 
 // Readme fetches the repository's README as plain text, truncated to limit
 // bytes. A missing README is not an error; some repositories have none.
+//
+// A README that exists but cannot be served — too large for the API, blocked,
+// taken down — comes back wrapped in ErrReadmeUnavailable, which is the
+// caller's cue that asking again later will not help. Any other error may be
+// the connection, the token or the rate limit, and says nothing about the
+// README itself.
 func (c *Client) Readme(ctx context.Context, owner, repo string, limit int) (string, error) {
 	var content string
 	err := c.retry(ctx, func() error {
@@ -247,12 +277,21 @@ func (c *Client) Readme(ctx context.Context, owner, repo string, limit int) (str
 		if err != nil {
 			return err
 		}
+		// go-github decodes base64 and passes plain text through. Anything
+		// else it cannot decode — "none" is what GitHub sends for a file
+		// over a megabyte — and a retry would get the same answer.
+		if enc := rc.GetEncoding(); enc != "" && enc != "base64" {
+			return backoff.Permanent(fmt.Errorf("%w: unsupported content encoding %q", ErrReadmeUnavailable, enc))
+		}
 		content, err = rc.GetContent()
 		return err
 	})
 	if err != nil {
 		if isNotFound(err) {
 			return "", nil
+		}
+		if isUnavailable(err) {
+			return "", fmt.Errorf("%w: %w", ErrReadmeUnavailable, err)
 		}
 		return "", err
 	}
@@ -274,35 +313,120 @@ func (c *Client) retry(ctx context.Context, call func() error) error {
 		}
 		return struct{}{}, classify(err)
 	})
+	// A primary rate limit that escapes the loop was not waited out, whether
+	// classify said so up front or the budget ran out first: backoff hands
+	// back the bare "retry after" it was last given, so the reason is
+	// restored here, once, for both.
+	var limit *github.RateLimitError
+	if errors.As(err, &limit) && !errors.Is(err, ErrRateLimited) {
+		return fmt.Errorf("%w: %w", ErrRateLimited, err)
+	}
 	return err
 }
 
 // classify turns a GitHub error into an instruction for the retry loop.
+//
+// The cases fall into three kinds. A rate limit names its own delay, so that
+// delay is asked for. A server error or a failure of the connection itself
+// says nothing about the request and is retried on the curve. Anything the
+// client got wrong — bad credentials, a resource it may not see, a request
+// GitHub could not accept — will fail again the same way, so it stops.
 func classify(err error) error {
+	// The operation already decided.
+	var permanent *backoff.PermanentError
+	if errors.As(err, &permanent) {
+		return err
+	}
 	var abuse *github.AbuseRateLimitError
 	if errors.As(err, &abuse) {
 		if d := abuse.GetRetryAfter(); d > 0 {
-			return backoff.RetryAfter(int(d.Seconds()) + 1)
+			return fmt.Errorf("%w: %w", backoff.RetryAfter(int(d.Seconds())+1), err)
 		}
 		return err
 	}
 	var limit *github.RateLimitError
 	if errors.As(err, &limit) {
-		if d := time.Until(limit.Rate.Reset.Time); d > 0 && d < time.Hour {
-			return backoff.RetryAfter(int(d.Seconds()) + 1)
+		d := time.Until(limit.Rate.Reset.Time)
+		switch {
+		case d <= 0:
+			// The window has reset, or the reset was not reported: the
+			// next attempt is what tells.
+			return err
+		case d < retryMaxWait:
+			return fmt.Errorf("%w: %w", backoff.RetryAfter(int(d.Seconds())+1), err)
+		default:
+			return backoff.Permanent(fmt.Errorf("%w: %w", ErrRateLimited, err))
 		}
-		return backoff.Permanent(err)
 	}
 	var resp *github.ErrorResponse
-	if errors.As(err, &resp) && resp.Response != nil && resp.Response.StatusCode >= 500 {
+	if errors.As(err, &resp) && resp.Response != nil {
+		switch {
+		case resp.Response.StatusCode >= 500:
+			return err
+		case resp.Response.StatusCode == http.StatusUnauthorized:
+			return backoff.Permanent(fmt.Errorf("%w: %w", ErrUnauthorized, err))
+		default:
+			return backoff.Permanent(err)
+		}
+	}
+	if isTransient(err) {
 		return err
 	}
 	return backoff.Permanent(err)
 }
 
+// isTransient reports whether an error is the connection's rather than the
+// request's: a timeout, a reset, a response cut short. Before this these were
+// treated as final, so a wobble in the network failed a request that would
+// have succeeded a second later.
+func isTransient(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
 func isNotFound(err error) bool {
+	return statusIs(err, http.StatusNotFound)
+}
+
+// isUnavailable recognises GitHub declining to serve a file that exists:
+// blocked or taken down (451, or a 403 carrying a block reason), or a blob
+// past the size the contents API serves. A 403 for any other reason — a
+// token without access, an organization enforcing SSO — is about the caller,
+// not the file, and is deliberately not matched.
+func isUnavailable(err error) bool {
+	if errors.Is(err, ErrReadmeUnavailable) {
+		return true
+	}
 	var resp *github.ErrorResponse
-	return errors.As(err, &resp) && resp.Response != nil && resp.Response.StatusCode == http.StatusNotFound
+	if !errors.As(err, &resp) || resp.Response == nil {
+		return false
+	}
+	switch resp.Response.StatusCode {
+	case http.StatusUnavailableForLegalReasons:
+		return true
+	case http.StatusForbidden:
+		if resp.Block != nil {
+			return true
+		}
+		msg := strings.ToLower(resp.Message)
+		return strings.Contains(msg, "too large") || strings.Contains(msg, "blocked")
+	}
+	return false
+}
+
+func statusIs(err error, code int) bool {
+	var resp *github.ErrorResponse
+	return errors.As(err, &resp) && resp.Response != nil && resp.Response.StatusCode == code
 }
 
 func firstEnv(names ...string) string {

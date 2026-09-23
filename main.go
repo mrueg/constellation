@@ -1029,11 +1029,19 @@ func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *plan
 	progress("fetching %d READMEs (cached afterwards; --readme=false to skip)", len(todo))
 
 	var (
-		mu      sync.Mutex
-		fetched int
-		failed  int
-		lastErr error
+		mu          sync.Mutex
+		fetched     int
+		unavailable int   // marked: the next run will not ask again
+		failed      int   // unmarked: the next run will
+		lastErr     error // the most recent of the failures
+		fatal       error // a failure that every further request would share
 	)
+	// stopped reports whether there is any point sending another job.
+	stopped := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return fatal != nil
+	}
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -1041,18 +1049,34 @@ func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *plan
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
+				if stopped() {
+					continue
+				}
 				text, err := c.Readme(ctx, repos[i].Owner(), repos[i].Name(), f.readmeBytes)
 				if err != nil {
 					mu.Lock()
-					failed++
-					lastErr = err
-					// A README that cannot be read now will not become
-					// readable later: over a megabyte, blocked, or taken
-					// down. Marking it stops every future run spending a
-					// request rediscovering that. An interruption is
-					// different — that repository must stay on the list.
-					if ctx.Err() == nil {
+					switch {
+					case errors.Is(err, gh.ErrReadmeUnavailable):
+						// This README will not become readable later:
+						// over a megabyte, blocked, or taken down.
+						// Marking it stops every future run spending a
+						// request rediscovering that.
 						repos[i].Readme = " "
+						unavailable++
+					case errors.Is(err, gh.ErrUnauthorized), errors.Is(err, gh.ErrRateLimited):
+						// Nothing after this will fare any better. Stop
+						// handing out work and say so once, instead of
+						// failing every remaining repository in turn.
+						if fatal == nil {
+							fatal = err
+						}
+					default:
+						// A timeout, a reset, an interruption: the README
+						// is left unmarked so the next run tries again.
+						// Marking it here is what once cached an empty
+						// README for a month because the network blinked.
+						failed++
+						lastErr = err
 					}
 					mu.Unlock()
 					continue
@@ -1071,6 +1095,9 @@ func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *plan
 		}()
 	}
 	for _, i := range todo {
+		if stopped() {
+			break
+		}
 		select {
 		case jobs <- i:
 		case <-ctx.Done():
@@ -1087,8 +1114,16 @@ func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *plan
 
 	// Silently dropping these was hiding a bad token or an exhausted rate
 	// limit behind quietly worse categories.
-	if failed > 0 {
-		progress("warning: %d of %d READMEs could not be read (last error: %v)", failed, len(todo), lastErr)
+	if fatal != nil {
+		progress("stopped fetching READMEs: %v", fatal)
+		progress("%d of %d READMEs are still unread; the next run picks them up",
+			len(todo)-fetched-unavailable, len(todo))
+	} else if failed > 0 {
+		progress("warning: %d of %d READMEs could not be read and will be tried again next run (last error: %v)",
+			failed, len(todo), lastErr)
+	}
+	if unavailable > 0 {
+		progress("%d READMEs cannot be served by GitHub (too large, blocked or taken down) and will not be asked for again", unavailable)
 	}
 	return fetched
 }

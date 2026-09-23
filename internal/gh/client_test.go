@@ -2,14 +2,196 @@ package gh
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/google/go-github/v90/github"
 )
+
+// fastRetries shortens the retry curve for the test, so a retried request
+// costs milliseconds rather than the seconds a real one waits.
+func fastRetries(t *testing.T) {
+	t.Helper()
+	interval, budget := retryInitialInterval, retryMaxWait
+	retryInitialInterval = time.Millisecond
+	retryMaxWait = 2 * time.Second
+	t.Cleanup(func() { retryInitialInterval, retryMaxWait = interval, budget })
+}
+
+// apiResponse is the HTTP half of a go-github error. Its Error method reads
+// the request, so one is supplied.
+func apiResponse(status int) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Request:    &http.Request{Method: http.MethodGet, URL: &url.URL{Scheme: "https", Host: "api.github.com", Path: "/x"}},
+	}
+}
+
+func apiError(status int) *github.ErrorResponse {
+	return &github.ErrorResponse{Response: apiResponse(status), Message: http.StatusText(status)}
+}
+
+func rateLimit(reset time.Time) *github.RateLimitError {
+	return &github.RateLimitError{
+		Rate:     github.Rate{Remaining: 0, Reset: github.Timestamp{Time: reset}},
+		Response: apiResponse(http.StatusForbidden),
+		Message:  "API rate limit exceeded",
+	}
+}
+
+// classify decides what the retry loop does with a failure, and the wrong
+// verdict is costly in both directions: retrying a bad token wastes the
+// budget, while giving up on a timeout failed a request that would have
+// succeeded a second later — and, upstream, got its README cached as
+// unreadable for a month.
+func TestClassify(t *testing.T) {
+	fastRetries(t)
+	transportTimeout := &url.Error{Op: "Get", URL: "https://api.github.com/x", Err: errors.New("dial tcp: i/o timeout")}
+	for _, tc := range []struct {
+		name      string
+		err       error
+		permanent bool
+		is        error // a sentinel the result must wrap, if any
+		after     bool  // the result must ask for a named delay
+	}{
+		{name: "transport error", err: transportTimeout},
+		{name: "connection reset", err: fmt.Errorf("reading body: %w", io.ErrUnexpectedEOF)},
+		{name: "server error", err: apiError(http.StatusBadGateway)},
+		{name: "bad credentials", err: apiError(http.StatusUnauthorized), permanent: true, is: ErrUnauthorized},
+		{name: "forbidden", err: apiError(http.StatusForbidden), permanent: true},
+		{name: "unprocessable", err: apiError(http.StatusUnprocessableEntity), permanent: true},
+		{name: "unknown", err: errors.New("something else"), permanent: true},
+		{name: "rate limit within budget", err: rateLimit(time.Now().Add(time.Second)), after: true},
+		{name: "rate limit beyond budget", err: rateLimit(time.Now().Add(time.Hour)), permanent: true, is: ErrRateLimited},
+		{name: "abuse limit", err: &github.AbuseRateLimitError{Response: apiResponse(http.StatusForbidden), RetryAfter: github.Ptr(30 * time.Second)}, after: true},
+	} {
+		got := classify(tc.err)
+		var permanent *backoff.PermanentError
+		if errors.As(got, &permanent) != tc.permanent {
+			t.Errorf("%s: permanent = %v, want %v (%v)", tc.name, !tc.permanent, tc.permanent, got)
+		}
+		var after *backoff.RetryAfterError
+		if errors.As(got, &after) != tc.after {
+			t.Errorf("%s: asks for a delay = %v, want %v (%v)", tc.name, !tc.after, tc.after, got)
+		}
+		if tc.is != nil && !errors.Is(got, tc.is) {
+			t.Errorf("%s: %v does not wrap %v", tc.name, got, tc.is)
+		}
+		// Whatever the verdict, the original error must still be there:
+		// it is what tells the user why.
+		if !errors.Is(got, tc.err) {
+			t.Errorf("%s: %v lost the original error", tc.name, got)
+		}
+	}
+
+	// The reason must survive as a typed error too, so a caller can read the
+	// reset time off it.
+	var limit *github.RateLimitError
+	if got := classify(rateLimit(time.Now().Add(time.Hour))); !errors.As(got, &limit) {
+		t.Errorf("the rate-limit error was lost behind the sentinel: %v", got)
+	}
+}
+
+// A rate limit whose reset is inside the budget when first seen can still
+// outlast it once the loop has spent time on other retries; backoff then
+// returns the bare "retry after" it was last handed. The caller must still be
+// told it was the rate limit.
+func TestRateLimitThatOutlastsTheBudgetIsNamed(t *testing.T) {
+	fastRetries(t)
+	// The reset is inside the budget, so classify asks to wait for it — but
+	// the wait plus what has elapsed is more than the budget allows, and
+	// backoff gives up on the spot.
+	reset := time.Now().Add(retryMaxWait - 500*time.Millisecond)
+	c := testRESTClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", fmt.Sprint(reset.Unix()))
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message":"API rate limit exceeded"}`)
+	}))
+	_, err := c.Readme(context.Background(), "a", "one", 100)
+	if !errors.Is(err, ErrRateLimited) {
+		t.Errorf("Readme under an exhausted quota returned %v, want ErrRateLimited", err)
+	}
+	if errors.Is(err, ErrReadmeUnavailable) {
+		t.Errorf("a rate limit was reported as the README being unavailable: %v", err)
+	}
+}
+
+// Readme separates the failures that are about the README from the ones that
+// are about the moment. Only the former wrap ErrReadmeUnavailable; a caller
+// that remembers them must not be handed a timeout or a bad token in the same
+// clothes.
+func TestReadmeReportsUnavailableFiles(t *testing.T) {
+	fastRetries(t)
+	for _, tc := range []struct {
+		name        string
+		status      int
+		body        string
+		unavailable bool
+		ok          bool
+	}{
+		{name: "too large", status: http.StatusForbidden, body: `{"message":"This API returns blobs up to 1 MB in size. The requested blob is too large to fetch via the API."}`, unavailable: true},
+		{name: "blocked", status: http.StatusForbidden, body: `{"message":"Repository access blocked","block":{"reason":"tos"}}`, unavailable: true},
+		{name: "taken down", status: http.StatusUnavailableForLegalReasons, body: `{"message":"Repository access blocked","block":{"reason":"dmca"}}`, unavailable: true},
+		{name: "unsupported encoding", status: http.StatusOK, body: `{"encoding":"none","content":null,"size":2000000}`, unavailable: true},
+		{name: "no readme", status: http.StatusNotFound, body: `{"message":"Not Found"}`, ok: true},
+		{name: "readable", status: http.StatusOK, body: `{"encoding":"base64","content":"aGVsbG8="}`, ok: true},
+		{name: "bad credentials", status: http.StatusUnauthorized, body: `{"message":"Bad credentials"}`},
+		{name: "forbidden for the caller", status: http.StatusForbidden, body: `{"message":"Resource protected by organization SAML enforcement."}`},
+	} {
+		c := testRESTClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(tc.status)
+			fmt.Fprint(w, tc.body)
+		}))
+		text, err := c.Readme(context.Background(), "a", "one", 100)
+		if tc.ok {
+			if err != nil {
+				t.Errorf("%s: %v", tc.name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: no error, got %q", tc.name, text)
+			continue
+		}
+		if errors.Is(err, ErrReadmeUnavailable) != tc.unavailable {
+			t.Errorf("%s: unavailable = %v, want %v (%v)", tc.name, !tc.unavailable, tc.unavailable, err)
+		}
+	}
+}
+
+// A connection that drops is retried, not reported. The first answer is cut
+// off mid-body; the second is fine.
+func TestReadmeRetriesATransportFailure(t *testing.T) {
+	fastRetries(t)
+	hits := 0
+	c := testRESTClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits == 1 {
+			// Announce a body and then hang up, which the client sees as
+			// an unexpected EOF.
+			w.Header().Set("Content-Length", "100")
+			fmt.Fprint(w, `{"enc`)
+			return
+		}
+		fmt.Fprint(w, `{"encoding":"base64","content":"aGVsbG8="}`)
+	}))
+	text, err := c.Readme(context.Background(), "a", "one", 100)
+	if err != nil {
+		t.Fatalf("a dropped connection was not retried: %v (after %d attempts)", err, hits)
+	}
+	if text != "hello" || hits != 2 {
+		t.Errorf("got %q after %d attempts, want \"hello\" after 2", text, hits)
+	}
+}
 
 // starPage renders the starred-repositories response for the given ids.
 func starPage(ids []int64) string {
