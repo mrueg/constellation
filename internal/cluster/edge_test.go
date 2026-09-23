@@ -462,6 +462,134 @@ func TestConsensusSurvivesTinyCorpora(t *testing.T) {
 	}
 }
 
+// unit3 is an L2-normalized row in three dimensions.
+func unit3(x, y, z float64) embed.Vector {
+	return embed.Normalize([]int32{0, 1, 2}, []float32{float32(x), float32(y), float32(z)})
+}
+
+// reseedSpace is the state recentre sees when a cluster has just emptied:
+// cluster 0 holds ten identical rows that fit it perfectly, cluster 1 has no
+// members, and the remaining cluster holds ten tight rows plus the given
+// misfits, each at an angle from the tight group's axis. It returns the space
+// and the assignment; the misfits are the last rows.
+func reseedSpace(k int, misfitAngles ...float64) (*embed.Space, []int) {
+	sp := &embed.Space{Dim: 3}
+	var assign []int
+	for range 10 {
+		sp.Rows = append(sp.Rows, unit3(1, 0, 0))
+		assign = append(assign, 0)
+	}
+	for range 10 {
+		sp.Rows = append(sp.Rows, unit3(0, 1, 0))
+		assign = append(assign, k-1)
+	}
+	for i, a := range misfitAngles {
+		// Alternate sides of the axis so that two misfits are distinct rows.
+		sign := 1.0
+		if i%2 == 1 {
+			sign = -1
+		}
+		sp.Rows = append(sp.Rows, unit3(0, math.Cos(a), sign*math.Sin(a)))
+		assign = append(assign, k-1)
+	}
+	return sp, assign
+}
+
+func emptyCentroids(k, dim int) [][]float64 {
+	out := make([][]float64, k)
+	for c := range out {
+		out[c] = make([]float64, dim)
+	}
+	return out
+}
+
+// An emptied cluster is re-seeded onto the repository that fits its own
+// centroid worst. That comparison was made in the same loop that normalizes
+// the centroids, so a cluster below the empty one was already a unit vector
+// while one above it was still a raw sum with a magnitude near its member
+// count. Every member of the lower cluster then looked like a worse fit than
+// any member of the higher one, and the "worst fit" was systematically a
+// perfect member of cluster 0 rather than the misfit sitting in cluster 2.
+func TestReseedPicksTheRealMisfit(t *testing.T) {
+	// At 0.55 radians from the tight group's axis the misfit's cosine to its
+	// centroid comes out near 0.88; the tight members are above 0.99 and the
+	// members of cluster 0 fit at exactly 1.
+	sp, assign := reseedSpace(3, 0.55)
+	misfit := len(sp.Rows) - 1
+	centroids := emptyCentroids(3, sp.Dim)
+	recentre(sp, assign, centroids, rand.New(rand.NewSource(1)))
+
+	if fit := sp.Rows[misfit].Dot(centroids[2]); fit > 0.95 || fit < 0.8 {
+		t.Fatalf("misfit fits its centroid at %.3f; the fixture is not the case it means to test", fit)
+	}
+	if assign[misfit] != 1 {
+		t.Fatalf("the empty cluster was re-seeded onto row %d (assigned row %d), not the misfit (row %d)",
+			rowMatching(sp, centroids[1]), indexOf(assign, 1), misfit)
+	}
+	want := dense(sp.Rows[misfit], sp.Dim)
+	for j := range want {
+		if math.Abs(centroids[1][j]-want[j]) > 1e-9 {
+			t.Fatalf("re-seeded centroid is %v, want the misfit %v", centroids[1], want)
+		}
+	}
+}
+
+// Two clusters emptied in the same pass must land on two different rows.
+// The assignment was not updated between picks, so the second search found
+// the same worst fit as the first and both clusters got the same centroid —
+// K clusters in name, K-1 in fact.
+func TestReseedGivesEachEmptyClusterItsOwnRow(t *testing.T) {
+	// Clusters 1 and 2 are both empty; cluster 3 holds two misfits.
+	sp, assign := reseedSpace(4, 0.55, 0.6)
+	for i := 10; i < 20; i++ {
+		assign[i] = 3
+	}
+	centroids := emptyCentroids(4, sp.Dim)
+	recentre(sp, assign, centroids, rand.New(rand.NewSource(1)))
+
+	a, b := indexOf(assign, 1), indexOf(assign, 2)
+	if a < 0 || b < 0 {
+		t.Fatalf("empty clusters were re-seeded but no row was moved into them: 1 -> %d, 2 -> %d", a, b)
+	}
+	if a == b {
+		t.Fatalf("both empty clusters were re-seeded onto row %d", a)
+	}
+	same := true
+	for j := range centroids[1] {
+		if centroids[1][j] != centroids[2][j] {
+			same = false
+		}
+	}
+	if same {
+		t.Fatalf("clusters 1 and 2 were given the same centroid %v", centroids[1])
+	}
+	// The two misfits are the two worst fits, so they are what should have
+	// been picked.
+	n := len(sp.Rows)
+	if a < n-2 || b < n-2 {
+		t.Errorf("re-seeded onto rows %d and %d, want the misfits %d and %d", a, b, n-2, n-1)
+	}
+}
+
+// rowMatching is the first row whose vector equals the centroid, or -1.
+func rowMatching(sp *embed.Space, centroid []float64) int {
+	for i, row := range sp.Rows {
+		if math.Abs(row.Dot(centroid)-1) < 1e-9 {
+			return i
+		}
+	}
+	return -1
+}
+
+func indexOf(assign []int, c int) int {
+	for i, a := range assign {
+		if a == c {
+			return i
+		}
+	}
+	return -1
+}
+
 // cancelCorpus is a corpus large enough that a full k-means search over it
 // takes far longer than the tests below allow, so that only a cancel that is
 // actually honoured lets them finish.

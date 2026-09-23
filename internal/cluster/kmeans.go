@@ -280,12 +280,33 @@ func recentre(sp *embed.Space, assign []int, centroids [][]float64, rng *rand.Ra
 			centroids[c][ix] += float64(row.Val[j])
 		}
 	}
+	// Every surviving centroid is normalized before any empty one is
+	// re-seeded. The fit that picks the re-seed is a dot product against
+	// each repository's own centroid, and a raw sum has a magnitude near its
+	// member count while a unit vector has one — so measuring against a mix
+	// of the two, as a single loop did, made every member of an
+	// already-normalized cluster look like a worse fit than any member of a
+	// not-yet-normalized one, and the "worst fit" was a perfect member of
+	// cluster 0 rather than the misfit.
 	for c := range centroids {
-		if counts[c] == 0 {
-			copy(centroids[c], dense(sp.Rows[worstFit(sp, assign, centroids, rng)], sp.Dim))
+		if counts[c] > 0 {
+			normalize(centroids[c])
+		}
+	}
+	for c := range centroids {
+		if counts[c] > 0 {
 			continue
 		}
-		normalize(centroids[c])
+		worst := worstFit(sp, assign, centroids, rng)
+		copy(centroids[c], dense(sp.Rows[worst], sp.Dim))
+		// Move the repository into the cluster it now seeds, so that a second
+		// empty cluster in the same pass does not pick the same row and end
+		// up a duplicate.
+		if prev := assign[worst]; prev >= 0 {
+			counts[prev]--
+		}
+		assign[worst] = c
+		counts[c]++
 	}
 }
 
