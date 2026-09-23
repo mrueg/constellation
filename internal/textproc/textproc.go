@@ -89,21 +89,49 @@ var stopwords = buildStopwords()
 // depends on nothing but the literal below, so there is no ordering to reason
 // about and the value can be seen at its declaration.
 func buildStopwords() map[string]bool {
-	const list = `a an and are as at be by for from has have how in into is it its of on or that the
+	// English function words. Bare "go" is among them: in prose it is a verb
+	// far more often than a language, and the Language field and the "golang"
+	// alias carry the language on a namespaced term that no list can touch.
+	const function = `a an and are as at be by for from has have how in into is it its of on or that the
 to was were will with you your this these those we our us they them he she his her not no but if
 then than there here when where which who whom whose what why all any both each few more most other
 some such only own same so too very can just should now about above after again against because
 before being below between during further off once out over under until while do does did doing
-library libraries lib package packages module modules project projects repo repository repositories
-tool tools toolkit simple easy fast small tiny lightweight modern minimal awesome list collection
-curated based written using use used uses using support supports supported implementation code
-source open free new go golang js javascript version like also via etc example examples demo
-best great powerful flexible full complete unofficial official yet another cross platform
-https www com io img png badge badges shields readme install installation usage license licence
-mit apache contributing changelog`
+new like also via etc yet another go`
+	// Developer boilerplate: the words with which any project at all is
+	// described. An entry has to name no subject in this domain and, measured
+	// on a real cache of 4,579 stars with READMEs read, to occur in between
+	// 2% and 40% of repositories — often enough to add a shared direction to
+	// every vector, and not so often that --max-df 0.4 already prunes it.
+	// "tool" is in 27% of them, "support" 27%, "open" 25%, "project" 22%,
+	// "source" 22%, "code" 20%, "create" 17%, "based" 17%, "example" 14%,
+	// "built" 13%, "help" 11%, "library" 10%, "simple" 10%, "implementation"
+	// 9%. Only "use" exceeds the cap, and only while READMEs are read; with
+	// --readme=false it is in 8%, so it stays.
+	//
+	// A word that is a subject as well as boilerplate is left in the
+	// vocabulary and max-df is trusted with it: "awesome" and "list" name the
+	// awesome-list category (2.9% and 10%, with 73 and 66 of those as
+	// topics), "template" the templating engines, "native" React Native,
+	// "build" the build systems, "power" power management. The list is
+	// matched before stemming, which is why "powerful" can be here while
+	// "power" is not. "boilerplate", "starter" and "sample" are below 2% and
+	// closer to a category than to noise.
+	const boilerplate = `library libraries lib package packages module modules project projects
+repo repository repositories tool tools toolkit simple easy fast small tiny lightweight modern
+minimal collection curated based written using use used uses support supports supported
+implementation code source open free version example examples demo best great powerful flexible
+full complete unofficial official cross platform made built create creates created creating
+help helps`
+	// README boilerplate: badge and URL fragments, and the section headings
+	// every README has.
+	const readme = `https www com io img png badge badges shields readme install installation usage
+license licence mit apache contributing changelog`
 	set := make(map[string]bool)
-	for _, w := range strings.Fields(list) {
-		set[w] = true
+	for _, list := range []string{function, boilerplate, readme} {
+		for _, w := range strings.Fields(list) {
+			set[w] = true
+		}
 	}
 	return set
 }
@@ -341,9 +369,7 @@ func Tokenize(s string) []string {
 
 func tokenize(s string) []token {
 	var out []token
-	for _, chunk := range strings.FieldsFunc(clean(s), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	}) {
+	for _, chunk := range strings.FieldsFunc(clean(s), separator) {
 		// A known term is kept whole. Splitting on case would otherwise turn
 		// "TypeScript" into "type" and "script", and a category named
 		// "Type & Script" helps nobody.
@@ -359,6 +385,63 @@ func tokenize(s string) []token {
 	}
 	return out
 }
+
+// tokenizeName tokenizes a repository name. The parts are what tokenize
+// produces — split on "-", "_", "." and camelCase, aliased, stopworded and
+// stemmed — and, when the name had a boundary to split on, the whole name is
+// returned as one more term with the separators removed: "kube-prometheus"
+// gives "kubernetes" and "prometheus" and also "kubeprometheus".
+//
+// The parts generalize and the compound identifies. Splitting is what lets
+// "nvim-treesitter" sit with the other Vim plugins, but it is also what turns
+// "TanStackQuery" into "tan", "stack" and "query", none of which is the
+// project. The compound is kept unstemmed and past the stopword list, so that
+// it can be learned whenever it recurs — forks, plugins, the "awesome-x"
+// lists — and is otherwise pruned by --min-df at no cost. A name without a
+// boundary is a single word already and is not reported twice.
+//
+// A compound the alias table knows is folded onto its canonical term, so a
+// name written "Type-Script" joins TypeScript rather than starting a spelling
+// of its own; when that coincides with one of the parts, as it does for
+// "TypeScript" itself, there is no compound to add.
+func tokenizeName(name string) (parts []token, compound token, ok bool) {
+	parts = tokenize(name)
+	written := strings.TrimSpace(name)
+	chunks := strings.FieldsFunc(spell(written), separator)
+	split := len(chunks) > 1
+	for _, c := range chunks {
+		if len(splitCamel(c)) > 1 {
+			split = true
+		}
+	}
+	joined := strings.ToLower(strings.Join(chunks, ""))
+	if !split || len(joined) < 2 {
+		return parts, token{}, false
+	}
+	term := joined
+	if a, aliased := aliases[joined]; aliased {
+		term = a
+	}
+	for _, p := range parts {
+		if p.term == term {
+			return parts, token{}, false
+		}
+	}
+	// The surface keeps the separators the author wrote, so that a category
+	// named after the compound reads "Kube-prometheus" rather than
+	// "Kubeprometheus"; the original casing is kept for the same reason.
+	compound = token{term: term, surface: strings.ToLower(written), raw: written, original: written}
+	if term != joined {
+		// Aliased: the surface is the canonical term, as normalize records it,
+		// and the spelling says nothing about how that term is written.
+		compound.surface, compound.original = term, ""
+	}
+	return parts, compound, true
+}
+
+// separator is what splits a phrase into words: anything that is neither a
+// letter nor a digit.
+func separator(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }
 
 func normalize(w string) (token, bool) {
 	raw := w
@@ -540,29 +623,28 @@ func BuildWith(w Weights, index TopicIndex, owner, name, description, language s
 			d.Surface[term] = surface
 		}
 	}
-	add := func(s string, weight float64) {
+	// Prefer the more distinctive spelling. A repository name is read before
+	// its description and is almost always lower case, so first-seen would
+	// record "mcp" and never see the "MCP" the description writes a line
+	// later.
+	noteCase := func(key, written string) {
+		if written == "" {
+			return
+		}
+		if prev, seen := d.Cased[key]; !seen || (!distinctive(prev) && distinctive(written)) {
+			d.Cased[key] = written
+		}
+	}
+	addTokens := func(toks []token, weight float64) {
 		// A term recorded with zero weight is not the same as no term: the
 		// vectoriser takes the logarithm of it, and log(0) poisons the whole
 		// matrix.
 		if weight <= 0 {
 			return
 		}
-		toks := tokenize(s)
 		for i, t := range toks {
 			d.Terms[t.term] += weight
 			note(t.term, t.surface)
-			// Prefer the more distinctive spelling. A repository name is read
-			// before its description and is almost always lower case, so
-			// first-seen would record "mcp" and never see the "MCP" the
-			// description writes a line later.
-			noteCase := func(key, written string) {
-				if written == "" {
-					return
-				}
-				if prev, seen := d.Cased[key]; !seen || (!distinctive(prev) && distinctive(written)) {
-					d.Cased[key] = written
-				}
-			}
 			noteCase(t.surface, t.original)
 			// Also under the word as written, so that an aliased word keeps a
 			// spelling of its own for display.
@@ -574,6 +656,7 @@ func BuildWith(w Weights, index TopicIndex, owner, name, description, language s
 			}
 		}
 	}
+	add := func(s string, weight float64) { addTokens(tokenize(s), weight) }
 	for _, t := range topics {
 		before := snapshot(d.Terms)
 		// With a topic weight of zero the label is not kept whole and the
@@ -604,7 +687,24 @@ func BuildWith(w Weights, index TopicIndex, owner, name, description, language s
 		}
 	}
 	add(owner, w.Owner)
-	add(name, w.Name)
+	// The name's parts, and the name as one word. The compound is the most
+	// precise term a name offers — "kubeprometheus" is shared only by
+	// repositories that really are kube-prometheus, its forks and its
+	// distributions — and it costs nothing while unique, because --min-df
+	// prunes it. It counts as much as each part rather than a fraction of
+	// that: an exact match on the whole name is stronger evidence than a
+	// match on "kube", and weighting it lower would say the opposite. For a
+	// name of two parts this raises what the field contributes by half, which
+	// is meant — the name carries most of the signal for the third of
+	// repositories that have no topics. It stays out of the bigram chain,
+	// where "prometheus kubeprometheus" would describe nothing.
+	parts, compound, ok := tokenizeName(name)
+	addTokens(parts, w.Name)
+	if ok && w.Name > 0 {
+		d.Terms[compound.term] += w.Name
+		note(compound.term, compound.surface)
+		noteCase(compound.surface, compound.original)
+	}
 	if lang := Language(language); lang != "" && w.Language > 0 {
 		d.Terms[lang] += w.Language
 		note(lang, lang)
