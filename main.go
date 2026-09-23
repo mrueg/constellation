@@ -126,6 +126,12 @@ func applyCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
+			// Checked here, before the plan is printed and confirmation asked
+			// for, so a bad edit is reported in one go and nothing is prompted
+			// for that could not be applied anyway.
+			if err := p.Validate(); err != nil {
+				return err
+			}
 			p.PrintN(os.Stdout, false, a.show)
 			return applyPlan(ctx, p, a)
 		},
@@ -391,6 +397,12 @@ func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
 		prev, lerr := plan.Load(f.out)
 		switch {
 		case lerr == nil:
+			// An incremental run carries the previous plan's names and
+			// descriptions over verbatim, edits included, so a broken edit
+			// would otherwise be copied into the new plan.
+			if err := prev.Validate(); err != nil {
+				return err
+			}
 			if p, err = extendPlan(ctx, lists, user, repos, f, prev); err != nil {
 				return err
 			}
