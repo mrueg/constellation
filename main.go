@@ -115,7 +115,7 @@ func applyCommand() *cli.Command {
 		// its own --show, and appending both produced a flag listed twice
 		// with two different descriptions, the second unreachable.
 		&cli.IntFlag{Name: "show", Usage: "print only the first N categories of the plan before applying (0 = all)", Sources: cli.EnvVars(envShow), Destination: &a.show},
-		&cli.StringFlag{Name: "token", Usage: "GitHub token; defaults to $GITHUB_TOKEN, then $GH_TOKEN, then the gh CLI's stored token. Changing lists needs the 'user' scope. Visible to other users in the process list — prefer the environment", Destination: &a.token},
+		tokenFlag(&a.token),
 	}, a.flags()...)
 	return &cli.Command{
 		Name:        "apply",
@@ -128,19 +128,32 @@ func applyCommand() *cli.Command {
 				return err
 			}
 			p.PrintN(os.Stdout, false, a.show)
-			return applyPlan(ctx, p, a)
+			token, err := gh.ResolveToken(ctx, a.token)
+			if err != nil {
+				return err
+			}
+			return applyPlan(ctx, p, a, token)
 		},
+	}
+}
+
+// tokenFlag is the one --token every command takes. Declared once so the four
+// commands cannot drift apart in what they say about it.
+func tokenFlag(dest *string) cli.Flag {
+	return &cli.StringFlag{
+		Name: "token",
+		Usage: "GitHub token; defaults to $GITHUB_TOKEN, then $GH_TOKEN, then the gh CLI's stored token. " +
+			"Changing lists needs the 'user' scope. Visible to other users in the process list — prefer the environment",
+		Destination: dest,
 	}
 }
 
 func showCommand() *cli.Command {
 	var token string
 	return &cli.Command{
-		Name:  "show",
-		Usage: "show the star lists you already have",
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "token", Usage: "GitHub token; defaults to $GITHUB_TOKEN, then $GH_TOKEN, then the gh CLI's stored token. Changing lists needs the 'user' scope", Destination: &token},
-		},
+		Name:   "show",
+		Usage:  "show the star lists you already have",
+		Flags:  []cli.Flag{tokenFlag(&token)},
 		Action: func(ctx context.Context, _ *cli.Command) error { return runShow(ctx, token) },
 	}
 }
@@ -164,7 +177,7 @@ func resetCommand() *cli.Command {
 			&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "do not ask for confirmation", Destination: &yes},
 			&cli.BoolFlag{Name: "continue", Usage: "keep going past a list that fails to delete", Destination: &keepGo},
 			&cli.DurationFlag{Name: "delay", Value: time.Second, Usage: "pause between deletions; GitHub asks for at least a second between mutating requests", Destination: &delay},
-			&cli.StringFlag{Name: "token", Usage: "GitHub token; defaults to $GITHUB_TOKEN, then $GH_TOKEN, then the gh CLI's stored token. Changing lists needs the 'user' scope", Destination: &token},
+			tokenFlag(&token),
 		},
 		Action: func(ctx context.Context, _ *cli.Command) error {
 			return runReset(ctx, token, yes, dryRun, keepGo, delay)
@@ -260,7 +273,7 @@ func (f *planFlags) flags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{Name: "out", Value: defaultPlanPath, Usage: "where to write the plan", Destination: &f.out},
 		&cli.StringFlag{Name: "markdown", Usage: "also write the categories as a markdown index to this file", Destination: &f.markdown},
-		&cli.StringFlag{Name: "token", Usage: "GitHub token; defaults to $GITHUB_TOKEN, then $GH_TOKEN, then the gh CLI's stored token. Changing lists needs the 'user' scope. Visible to other users in the process list — prefer the environment", Destination: &f.token},
+		tokenFlag(&f.token),
 
 		&cli.IntFlag{Name: "lsa-dims", Value: 150, Usage: "latent dimensions kept by the SVD", Destination: &f.lsaDims},
 		&cli.Int64Flag{Name: "lsa-seed", Value: 1, Usage: "seed for the randomized SVD, deliberately separate from --seed so that changing the clustering seed does not also change the embedding underneath it", Destination: &f.lsaSeed},
@@ -339,7 +352,16 @@ func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
 		return fmt.Errorf("--stale-after: %w", err)
 	}
 
-	client, err := gh.NewClient(f.token)
+	// Resolved once and shared by every client below, including the apply
+	// half of plan --apply: the fallback to the gh CLI is a subprocess with a
+	// deadline, and finding it again per client would pay that deadline
+	// repeatedly — and could act as a different account if the environment
+	// changed in between.
+	token, err := gh.ResolveToken(ctx, f.token)
+	if err != nil {
+		return err
+	}
+	client, err := gh.NewClient(token)
 	if err != nil {
 		return err
 	}
@@ -379,13 +401,9 @@ func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
 		}
 	}
 
-	// Reading existing lists is a convenience, not a requirement: without a
-	// usable token the plan is still correct, it just cannot mark which
-	// categories already exist.
-	lists, err := gh.NewListsClient(f.token)
+	lists, err := gh.NewListsClient(token)
 	if err != nil {
-		progress("not reading existing lists: %v", err)
-		lists = nil
+		return err
 	}
 	var p *plan.Plan
 	if f.incremental {
@@ -420,16 +438,11 @@ func runPlan(ctx context.Context, f *planFlags, af *applyFlags) error {
 		fmt.Printf("markdown index written to %s\n", f.markdown)
 	}
 
-	// plan --apply shares one --token; without this the write half would fall
-	// back to the ambient credential and could act as a different account.
-	if af.token == "" {
-		af.token = f.token
-	}
 	if !f.apply {
 		fmt.Printf("\nnothing has been changed on GitHub. Review the plan, then run:\n  constellation apply --plan %s\n", f.out)
 		return nil
 	}
-	return applyPlan(ctx, p, af)
+	return applyPlan(ctx, p, af, token)
 }
 
 // writeMarkdown renders the plan to a file. The rendering itself ignores write
@@ -1306,8 +1319,10 @@ func (a *applyFlags) categories() []string {
 	return out
 }
 
-func applyPlan(ctx context.Context, p *plan.Plan, a *applyFlags) error {
-	c, err := gh.NewListsClient(a.token)
+// applyPlan writes the plan to GitHub with an already-resolved token; the
+// caller resolves it so plan --apply uses the same one it planned with.
+func applyPlan(ctx context.Context, p *plan.Plan, a *applyFlags, token string) error {
+	c, err := gh.NewListsClient(token)
 	if err != nil {
 		return err
 	}
@@ -1468,7 +1483,11 @@ func confirm(p *plan.Plan, only []string, limit int, reconcile, force bool) (boo
 	return answer == "y" || answer == "yes", nil
 }
 
-func runReset(ctx context.Context, token string, yes, dryRun, keepGo bool, delay time.Duration) error {
+func runReset(ctx context.Context, explicitToken string, yes, dryRun, keepGo bool, delay time.Duration) error {
+	token, err := gh.ResolveToken(ctx, explicitToken)
+	if err != nil {
+		return err
+	}
 	c, err := gh.NewListsClient(token)
 	if err != nil {
 		return err
@@ -1506,7 +1525,11 @@ func runReset(ctx context.Context, token string, yes, dryRun, keepGo bool, delay
 	return err
 }
 
-func runShow(ctx context.Context, token string) error {
+func runShow(ctx context.Context, explicitToken string) error {
+	token, err := gh.ResolveToken(ctx, explicitToken)
+	if err != nil {
+		return err
+	}
 	c, err := gh.NewListsClient(token)
 	if err != nil {
 		return err

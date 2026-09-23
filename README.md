@@ -46,7 +46,8 @@ page, built for linux and macOS on amd64 and arm64.
 
 `constellation` uses `$GITHUB_TOKEN`, then `$GH_TOKEN`, then whatever the `gh`
 CLI has stored, so if you already run `gh auth login` there is nothing to set
-up. `--token` overrides all three.
+up. `--token` overrides all three. The token is looked up once per command, so
+`plan --apply` applies with the same token it planned with.
 
 **Reading** needs no scopes for public stars; add `repo` if you have starred
 private repositories you want included.
