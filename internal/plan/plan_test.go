@@ -966,6 +966,128 @@ func TestVerifyReportsMissingLists(t *testing.T) {
 	}
 }
 
+// `apply --limit N --verify` always failed: the run stopped after N writes and
+// verification then held the account to every placement in the plan, most of
+// which the run had never written. What a capped run is held to is what it
+// wrote — and that must still be really checked.
+func TestVerifyAppliedAfterACappedRun(t *testing.T) {
+	f, c, p := testSetup(t)
+	res, err := Apply(context.Background(), c, p, ApplyOptions{Limit: 1, Out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.StoppedAtCap || res.ReposFiled != 1 {
+		t.Fatalf("filed %d, stopped %v; want 1, true", res.ReposFiled, res.StoppedAtCap)
+	}
+	if n := len(res.Placed["Kubernetes"]) + len(res.Placed["Rust"]); n != 1 {
+		t.Errorf("placed = %v, want the one repository written", res.Placed)
+	}
+
+	// The whole plan is not in place, and saying so is what made --verify
+	// useless with --limit.
+	whole, err := Verify(context.Background(), c, p, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whole.OK() {
+		t.Fatal("the whole plan verified after one write; the test is not exercising the cap")
+	}
+
+	v, err := VerifyApplied(context.Background(), c, p, nil, res, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.OK() {
+		t.Errorf("a capped run failed verification of its own writes: missing=%v lists=%v", v.Missing, v.MissingLists)
+	}
+	if v.Checked != 1 {
+		t.Errorf("checked %d placements, want the 1 written", v.Checked)
+	}
+
+	// Scoping must not turn verification into a rubber stamp: a write that
+	// reported success but did not take effect is still caught.
+	f.mu.Lock()
+	for repo := range f.member {
+		f.member[repo] = nil
+	}
+	f.mu.Unlock()
+	v, err = VerifyApplied(context.Background(), c, p, nil, res, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.OK() {
+		t.Error("a lost write passed verification")
+	}
+}
+
+// A second, uncapped run finds everything in place; those count as asserted
+// too, so a capped re-run over a filed account still verifies what it saw.
+func TestVerifyAppliedCountsWhatWasAlreadyInPlace(t *testing.T) {
+	_, c, p := testSetup(t)
+	if _, err := Apply(context.Background(), c, p, ApplyOptions{Out: io.Discard}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Apply(context.Background(), c, p, ApplyOptions{Out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ReposSkipped != 3 {
+		t.Fatalf("skipped %d, want 3", res.ReposSkipped)
+	}
+	if len(res.Placed["Kubernetes"]) != 2 || len(res.Placed["Rust"]) != 1 {
+		t.Errorf("placed = %v, want every placement found in place", res.Placed)
+	}
+	v, err := VerifyApplied(context.Background(), c, p, nil, res, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.OK() || v.Checked != 3 {
+		t.Errorf("ok=%v checked=%d, want the whole plan verified", v.OK(), v.Checked)
+	}
+}
+
+// A category skipped because a list of its name was not created here was never
+// written, so verification must not hold the account to it.
+func TestVerifyAppliedSkipsConflicts(t *testing.T) {
+	f, c, p := testSetup(t)
+	f.lists = append(f.lists, "Kubernetes")
+	f.described["Kubernetes"] = "my own list"
+
+	res, err := Apply(context.Background(), c, p, ApplyOptions{Out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("conflicts = %v, want [Kubernetes]", res.Conflicts)
+	}
+	whole, err := Verify(context.Background(), c, p, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whole.OK() {
+		t.Fatal("the whole plan verified despite an untouched category")
+	}
+	v, err := VerifyApplied(context.Background(), c, p, nil, res, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.OK() || v.Checked != 1 {
+		t.Errorf("ok=%v checked=%d missing=%v; want only Rust's one placement checked", v.OK(), v.Checked, v.Missing)
+	}
+}
+
+// A dry run writes nothing, so it asserts nothing beyond what it found.
+func TestDryRunAssertsOnlyWhatIsInPlace(t *testing.T) {
+	_, c, p := testSetup(t)
+	res, err := Apply(context.Background(), c, p, ApplyOptions{DryRun: true, Out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Placed) != 0 {
+		t.Errorf("a dry run over an empty account recorded placements: %v", res.Placed)
+	}
+}
+
 // A run with nothing to write reads only the planned lists. Paging contents is
 // the slowest part of starting an apply, and the planned lists alone settle
 // whether there is anything to do.

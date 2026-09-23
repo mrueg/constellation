@@ -38,6 +38,53 @@ func (v *VerifyResult) OK() bool {
 // It costs one page read per list, not one per repository, so it is cheap
 // enough to run after every apply.
 func Verify(ctx context.Context, c *gh.ListsClient, p *Plan, only []string, out io.Writer) (*VerifyResult, error) {
+	return VerifyApplied(ctx, c, p, only, nil, out)
+}
+
+// VerifyApplied checks what an apply run left the account asserting, which is
+// not always the whole plan.
+//
+// A run that completed asserts every placement in the categories it was asked
+// for, less any it skipped because a list of that name was not created here.
+// A run that stopped at --limit asserts only the placements it made or found
+// in place: holding it to the rest would fail by construction, since it never
+// wrote them — which is what made `apply --limit N --verify` always exit 1.
+// A nil res verifies the plan as it stands.
+func VerifyApplied(ctx context.Context, c *gh.ListsClient, p *Plan, only []string, res *ApplyResult, out io.Writer) (*VerifyResult, error) {
+	skip := map[string]bool{}
+	if res != nil {
+		for _, n := range res.Conflicts {
+			skip[strings.ToLower(n)] = true
+		}
+	}
+	var want []placement
+	for _, cat := range selected(p.Categories, only) {
+		if skip[strings.ToLower(cat.Name)] {
+			continue
+		}
+		var repos []string
+		if res != nil && res.StoppedAtCap {
+			repos = res.Placed[cat.Name]
+		} else {
+			for _, r := range cat.Repos {
+				repos = append(repos, r.FullName)
+			}
+		}
+		if len(repos) == 0 {
+			continue
+		}
+		want = append(want, placement{list: cat.Name, repos: repos})
+	}
+	return verifyPlacements(ctx, c, want, out)
+}
+
+// placement is one list and the repositories that must be in it.
+type placement struct {
+	list  string
+	repos []string
+}
+
+func verifyPlacements(ctx context.Context, c *gh.ListsClient, want []placement, out io.Writer) (*VerifyResult, error) {
 	if out == nil {
 		out = io.Discard
 	}
@@ -60,19 +107,16 @@ func Verify(ctx context.Context, c *gh.ListsClient, p *Plan, only []string, out 
 		}
 	}
 
-	for _, cat := range selected(p.Categories, only) {
-		if len(cat.Repos) == 0 {
-			continue
-		}
-		name := strings.ToLower(cat.Name)
+	for _, pl := range want {
+		name := strings.ToLower(pl.list)
 		if _, ok := byName[name]; !ok {
-			res.MissingLists = append(res.MissingLists, cat.Name)
+			res.MissingLists = append(res.MissingLists, pl.list)
 			continue
 		}
-		for _, r := range cat.Repos {
+		for _, r := range pl.repos {
 			res.Checked++
-			if !filed[r.FullName][name] {
-				res.Missing[cat.Name] = append(res.Missing[cat.Name], r.FullName)
+			if !filed[r][name] {
+				res.Missing[pl.list] = append(res.Missing[pl.list], r)
 			}
 		}
 	}

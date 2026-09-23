@@ -1415,7 +1415,15 @@ func applyPlan(ctx context.Context, p *plan.Plan, a *applyFlags, token string) e
 	}
 	if a.verify && !a.dryRun {
 		fmt.Println("\nverifying...")
-		v, verr := plan.Verify(ctx, c, p, only, os.Stdout)
+		// Only what this run left the account asserting is checked: a run
+		// that stopped at --limit never wrote the rest, and a category
+		// skipped over a name conflict was never touched. Verifying the whole
+		// plan after either made --verify fail by construction.
+		if res.StoppedAtCap {
+			fmt.Printf("%s the run stopped at --limit %d, so only the placements it made are checked; "+
+				"run again without --limit to verify the whole plan\n", ui.Info("note:"), a.limit)
+		}
+		v, verr := plan.VerifyApplied(ctx, c, p, only, res, os.Stdout)
 		if verr != nil {
 			return verr
 		}

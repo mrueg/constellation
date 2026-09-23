@@ -81,6 +81,19 @@ type ApplyResult struct {
 	// Adopted are lists that were taken over with --adopt: their descriptions
 	// were replaced and they are now managed here.
 	Adopted []string
+	// Placed maps a category to the repositories this run put in it or found
+	// already there: the placements the run asserts are on the account, and
+	// so the ones a verification can hold it to. A run that stopped at
+	// --limit, or skipped a category over a name conflict, asserts nothing
+	// about the rest. A dry run records only what was already in place.
+	Placed map[string][]string
+}
+
+func (r *ApplyResult) place(category, repo string) {
+	if r.Placed == nil {
+		r.Placed = map[string][]string{}
+	}
+	r.Placed[category] = append(r.Placed[category], repo)
 }
 
 // Apply creates the planned lists and files each repository into its category.
@@ -330,15 +343,18 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 		drop []string
 	}
 	var changes []change
-	seen := map[string]int{} // repo -> index into changes
+	seen := map[string]int{}         // repo -> index into changes
+	catOfList := map[string]string{} // list id -> category name, for Placed
 	for _, cat := range work {
 		listID, ok := wantList[strings.ToLower(cat.Name)]
 		if !ok && !opt.DryRun {
 			continue // creation failed and --continue is on
 		}
+		catOfList[listID] = cat.Name
 		for _, r := range cat.Repos {
 			if current[r.FullName][listID] {
 				res.ReposSkipped++
+				res.place(cat.Name, r.FullName)
 				continue
 			}
 			if i, ok := seen[r.FullName]; ok {
@@ -444,6 +460,9 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 			res.ReposRemoved += len(ch.drop)
 			if len(ch.add) > 0 {
 				res.ReposFiled++
+			}
+			for _, lid := range ch.add {
+				res.place(catOfList[lid], it.Name)
 			}
 			fmt.Fprintf(out, "%s %s %s\n", ui.Muted(prog.label()), ui.Added("+"), ui.Name(it.Name))
 		}
