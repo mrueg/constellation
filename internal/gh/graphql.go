@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,19 +133,40 @@ func graphQLFailure(errs []graphQLError) error {
 // the last. Treating that as a plain failure threw away the ninety-nine, so a
 // single deleted star aborted an entire apply.
 func (c *ListsClient) queryPartial(ctx context.Context, query string, vars map[string]any, out any) ([]graphQLError, error) {
-	return c.queryPartialN(ctx, query, vars, out, 0)
+	return c.queryPartialN(ctx, query, vars, out, 0, 0)
 }
 
-// maxRateLimitWaits bounds how long a single operation will sit waiting out
+// maxRateLimitWaits bounds how many times a single operation will wait out
 // the GraphQL budget, so a persistently exhausted account fails with a message
 // rather than hanging.
 const maxRateLimitWaits = 5
 
-func (c *ListsClient) queryPartialN(ctx context.Context, query string, vars map[string]any, out any, waits int) ([]graphQLError, error) {
+// maxRateLimitWait caps one wait for the GraphQL budget. The primary window is
+// an hour, so a reset an hour away is normal; anything much beyond that is a
+// clock that cannot be trusted. It is a variable so tests can shrink it.
+var maxRateLimitWait = 65 * time.Minute
+
+// rateLimitFallbackWait is used when the reply names no reset time at all. It
+// is a variable so tests can shrink it.
+var rateLimitFallbackWait = time.Minute
+
+// errBadGateway marks a 502 or 504, which is what GitHub answers when a
+// request is too much work to finish — as distinct from the other 5xx codes,
+// which mean GitHub itself is unwell.
+var errBadGateway = errors.New("github could not complete the request")
+
+// queryPartialN is queryPartial with its counters exposed: waits is how many
+// times the rate limit has already been waited out for this operation, and
+// gatewayTries, when positive, is how many 502/504 answers to take before
+// giving up with errBadGateway instead of riding out the whole retry budget —
+// for a caller that has a cheaper remedy than waiting. Other failures keep the
+// full budget either way.
+func (c *ListsClient) queryPartialN(ctx context.Context, query string, vars map[string]any, out any, waits, gatewayTries int) ([]graphQLError, error) {
 	body, err := json.Marshal(map[string]any{"query": query, "variables": vars})
 	if err != nil {
 		return nil, err
 	}
+	gateways := 0
 
 	// Creating a list is the one operation that is not safe to replay: a
 	// timed-out request GitHub actually processed would make a second list.
@@ -170,7 +193,16 @@ func (c *ListsClient) queryPartialN(ctx context.Context, query string, vars map[
 			return nil, wait
 		}
 		// A 502 is what GitHub answers when a query takes too long, and it is
-		// transient; without this it ended the run.
+		// transient; without this it ended the run. It is marked so a caller
+		// with something to split can tell it from a real outage.
+		if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusGatewayTimeout {
+			_ = resp.Body.Close()
+			err := fmt.Errorf("github returned %s: %w", resp.Status, errBadGateway)
+			if gateways++; gatewayTries > 0 && gateways >= gatewayTries {
+				return nil, backoff.Permanent(err)
+			}
+			return nil, err
+		}
 		if resp.StatusCode >= 500 {
 			_ = resp.Body.Close()
 			return nil, fmt.Errorf("github returned %s", resp.Status)
@@ -203,18 +235,27 @@ func (c *ListsClient) queryPartialN(ctx context.Context, query string, vars map[
 		// Exceeding the GraphQL budget arrives as HTTP 200 with an error in
 		// the body, so the status-code check inside the retry never sees it.
 		// Waiting is the only remedy, exactly as for the REST limits.
+		//
+		// The reply says when the budget comes back: the primary window is
+		// an hour, so a fixed minute's wait almost never reached it, and five
+		// of them in a row was five wasted minutes ending in an error.
 		if e.Type == "RATE_LIMITED" {
 			if waits >= maxRateLimitWaits {
 				return nil, fmt.Errorf("GitHub's GraphQL rate limit is still exhausted after %d waits: %s",
 					waits, e.Message)
 			}
-			c.logf("GraphQL rate limit reached, waiting a minute")
+			wait, ok := rateLimitWait(resp.Header, time.Now())
+			if !ok {
+				wait = rateLimitFallbackWait
+			}
+			wait = min(wait, maxRateLimitWait)
+			c.logf("GraphQL rate limit reached, waiting %s for it to reset", wait.Round(time.Second))
 			select {
-			case <-time.After(time.Minute):
+			case <-time.After(wait):
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
-			return c.queryPartialN(ctx, query, vars, out, waits+1)
+			return c.queryPartialN(ctx, query, vars, out, waits+1, gatewayTries)
 		}
 		// A missing scope is terminal however it is phrased: fine-grained
 		// tokens report it as FORBIDDEN rather than INSUFFICIENT_SCOPES, and
@@ -232,4 +273,31 @@ func (c *ListsClient) queryPartialN(ctx context.Context, query string, vars map[
 		}
 	}
 	return envelope.Errors, nil
+}
+
+// rateLimitWait reads how long a rate-limited reply asks the client to wait.
+//
+// Retry-After is authoritative when present, as integer seconds or an HTTP
+// date; otherwise X-RateLimit-Reset names the second the window reopens. A
+// second is added either way so the retry lands inside the new window rather
+// than on its edge. The reported bool is false when no header is usable.
+func rateLimitWait(h http.Header, now time.Time) (time.Duration, bool) {
+	if v := h.Get("Retry-After"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return time.Duration(secs+1) * time.Second, true
+		}
+		if at, err := http.ParseTime(v); err == nil {
+			if d := at.Sub(now); d > 0 {
+				return d + time.Second, true
+			}
+		}
+	}
+	if v := h.Get("X-RateLimit-Reset"); v != "" {
+		if epoch, err := strconv.ParseInt(v, 10, 64); err == nil {
+			if d := time.Unix(epoch, 0).Sub(now); d > 0 {
+				return d + time.Second, true
+			}
+		}
+	}
+	return 0, false
 }
