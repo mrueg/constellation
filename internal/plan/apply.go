@@ -383,16 +383,18 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 	}
 
 	// Node ids are needed to write, and only for repositories that are
-	// actually changing; they are resolved a hundred at a time.
-	ids := map[string]string{}
-	if !opt.DryRun {
-		names := make([]string, 0, len(changes))
-		for _, ch := range changes {
-			names = append(names, ch.repo)
-		}
-		if ids, err = c.RepoIDs(ctx, names); err != nil {
-			return res, err
-		}
+	// actually changing; they are resolved a hundred at a time. A dry run
+	// resolves them too: it is a read, and it is what tells a repository
+	// GitHub no longer knows — renamed or deleted since it was starred — from
+	// one that can be filed. Skipping it made a dry run promise "would file"
+	// for a repository the real run then rejected.
+	names := make([]string, 0, len(changes))
+	for _, ch := range changes {
+		names = append(names, ch.repo)
+	}
+	ids, err := c.RepoIDs(ctx, names)
+	if err != nil {
+		return res, err
 	}
 
 	batchSize := max(opt.Batch, 1)
@@ -459,6 +461,19 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 			return res, nil
 		}
 		prog.step()
+		// Decided before the dry-run branch so that a preview and a real run
+		// treat an unknown repository the same way: stop, or with --continue
+		// record the failure and go on.
+		id, ok := ids[ch.repo]
+		if !ok {
+			err := fmt.Errorf("filing %s: GitHub does not know this repository (renamed or deleted?)", ch.repo)
+			if !opt.ContinueOnError {
+				return res, err
+			}
+			res.Errors = append(res.Errors, err)
+			fmt.Fprintf(out, "  %s %s: unknown to GitHub (renamed or deleted?)\n", ui.Removed("!"), ui.Name(ch.repo))
+			continue
+		}
 		if opt.DryRun {
 			switch {
 			case len(ch.add) > 0 && len(ch.drop) > 0:
@@ -474,16 +489,6 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 			if len(ch.add) > 0 {
 				res.ReposFiled++
 			}
-			continue
-		}
-		id, ok := ids[ch.repo]
-		if !ok {
-			err := fmt.Errorf("filing %s: GitHub does not know this repository (renamed or deleted?)", ch.repo)
-			if !opt.ContinueOnError {
-				return res, err
-			}
-			res.Errors = append(res.Errors, err)
-			fmt.Fprintf(out, "  %s %s\n", ui.Removed("!"), ui.Name(ch.repo))
 			continue
 		}
 		// Everything it is already in, plus everything being added: the
