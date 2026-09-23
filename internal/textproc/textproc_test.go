@@ -16,7 +16,9 @@ func TestTokenize(t *testing.T) {
 		// Terms are stems: grouping keys, not labels. Names are built from
 		// the surface forms recorded alongside them.
 		{"k8s_operator", []string{"kubernetes", "oper"}},
-		{"the best awesome list of tools", nil},
+		// "awesome" and "list" are a category, not filler: see
+		// TestBoilerplateWordsAreDropped.
+		{"the best awesome list of tools", []string{"awesom", "list"}},
 		{"parsers", []string{"parser"}},
 		{"kubernetes", []string{"kubernetes"}},
 		{"v1.2.3", nil},
@@ -291,5 +293,104 @@ func TestPunctuatedNamesSurvive(t *testing.T) {
 		if got := Language(lang); got != LangPrefix+want {
 			t.Errorf("Language(%q) = %q, want %q", lang, got, LangPrefix+want)
 		}
+	}
+}
+
+// The words every project describes itself with add a shared direction to
+// every vector; the words that name a category in this domain must not go
+// with them, even where they are just as common.
+func TestBoilerplateWordsAreDropped(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"a simple fast lightweight library written in rust", []string{LangPrefix + "rust"}},
+		{"a powerful modern tool to help you create and use projects", nil},
+		{"official implementation of the paper, based on the open source code", []string{"paper"}},
+		{"examples and a demo built for the repository", nil},
+		{"made with free tools", nil},
+		// Category words survive: awesome lists, templating engines, React
+		// Native, build systems, power management.
+		{"an awesome list of templates", []string{"awesom", "list", "templat"}},
+		{"react native build tooling for power users", []string{"react", "nativ", "build", "tool", "power", "user"}},
+	} {
+		if got := Tokenize(tc.in); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("Tokenize(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// nameTerms flattens tokenizeName into the parts followed by the compound.
+func nameTerms(name string) []string {
+	parts, compound, ok := tokenizeName(name)
+	var out []string
+	for _, p := range parts {
+		out = append(out, p.term)
+	}
+	if ok {
+		out = append(out, compound.term)
+	}
+	return out
+}
+
+// A repository name is split into parts, which generalize, and kept whole as
+// a compound, which identifies. A name without a boundary is one word and is
+// not reported twice.
+func TestTokenizeNameKeepsTheCompound(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"kube-prometheus", []string{"kubernetes", "prometheus", "kubeprometheus"}},
+		{"go_router", []string{"router", "gorouter"}},
+		{"TanStackQuery", []string{"tan", "stack", "queri", "tanstackquery"}},
+		{"HTTPServer", []string{"http", "server", "httpserver"}},
+		{"nvim-treesitter", []string{"vim", "treesitt", "nvimtreesitter"}},
+		{"vue.js", []string{"vue", LangPrefix + "javascript", "vuejs"}},
+		// The compound is exempt from the stopword list and the stemmer; the
+		// parts are not.
+		{"awesome-tools", []string{"awesom", "awesometools"}},
+		// One word, once.
+		{"goreleaser", []string{"goreleas"}},
+		{"kubernetes", []string{"kubernetes"}},
+		// A known compound is already kept whole, and folded onto the alias.
+		{"TypeScript", []string{LangPrefix + "typescript"}},
+		{"Type-Script", []string{"type", "script", LangPrefix + "typescript"}},
+		{"node.js", []string{"nodejs"}},
+		{"", nil},
+	} {
+		if got := nameTerms(tc.in); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("tokenizeName(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The compound counts as much as each part, is not chained into bigrams, and
+// is displayed the way the author wrote it.
+func TestBuildWeightsTheNameCompoundLikeItsParts(t *testing.T) {
+	d := Build("acme", "kube-prometheus", "", "", nil, "")
+	if d.Terms["kubeprometheus"] != d.Terms["prometheus"] || d.Terms["kubeprometheus"] != WeightName {
+		t.Errorf("compound should weigh as much as a part: %v", d.Terms)
+	}
+	if len(d.Bigrams) != 1 || d.Bigrams["kubernetes prometheus"] == 0 {
+		t.Errorf("compound should stay out of the bigrams: %v", d.Bigrams)
+	}
+	if got := d.Surface["kubeprometheus"]; got != "kube-prometheus" {
+		t.Errorf("compound surface = %q, want the name as written", got)
+	}
+	d = Build("acme", "TanStackQuery", "", "", nil, "")
+	if got := d.Cased["tanstackquery"]; got != "TanStackQuery" {
+		t.Errorf("compound casing = %q, want the name as written", got)
+	}
+	// A single-word name is counted once, at name weight.
+	d = Build("acme", "goreleaser", "", "", nil, "")
+	if len(d.Terms) != 2 || d.Terms["goreleas"] != WeightName {
+		t.Errorf("single-word name should produce one term besides the owner: %v", d.Terms)
+	}
+	// "TypeScript" survives as the language term, and never as "type" and
+	// "script".
+	d = Build("acme", "TypeScript", "", "", nil, "")
+	if d.Terms[LangPrefix+"typescript"] != WeightName || d.Terms["type"] != 0 || d.Terms["script"] != 0 {
+		t.Errorf("TypeScript = %v", d.Terms)
 	}
 }
