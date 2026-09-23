@@ -390,6 +390,18 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 	batchSize := max(opt.Batch, 1)
 	var pending []gh.ItemLists
 	var applied []change
+	// queued is what pending will add to ReposFiled+ReposRemoved once it is
+	// flushed. The limit has to be checked against it, not only against the
+	// counters, because those advance only when a batch is written — and a
+	// batch fills slower than the limit is reached.
+	queued := 0
+	cost := func(ch change) int {
+		n := len(ch.drop)
+		if len(ch.add) > 0 {
+			n++
+		}
+		return n
+	}
 
 	// flush writes the accumulated changes and folds the outcome back into the
 	// result. Failures are per repository even inside a batch, because GitHub
@@ -404,7 +416,7 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 				return fmt.Errorf("filing %d repositories: %w", len(pending), err)
 			}
 			res.Errors = append(res.Errors, err)
-			pending, applied = nil, nil
+			pending, applied, queued = nil, nil, 0
 			return nil
 		}
 		for i, it := range pending {
@@ -425,13 +437,13 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 			}
 			fmt.Fprintf(out, "%s %s %s\n", ui.Muted(prog.label()), ui.Added("+"), ui.Name(it.Name))
 		}
-		pending, applied = nil, nil
+		pending, applied, queued = nil, nil, 0
 		pause(ctx, opt.Delay)
 		return nil
 	}
 
 	for _, ch := range changes {
-		if opt.Limit > 0 && res.ReposFiled+res.ReposRemoved >= opt.Limit {
+		if opt.Limit > 0 && res.ReposFiled+res.ReposRemoved+queued >= opt.Limit {
 			if err := flush(); err != nil {
 				return res, err
 			}
@@ -480,6 +492,7 @@ func Apply(ctx context.Context, c *gh.ListsClient, p *Plan, opt ApplyOptions) (*
 		}
 		pending = append(pending, gh.ItemLists{RepoID: id, ListIDs: sortedKeysOf(want), Name: ch.repo})
 		applied = append(applied, ch)
+		queued += cost(ch)
 		if len(pending) < batchSize {
 			continue
 		}

@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -329,6 +330,74 @@ func TestApplyRespectsLimitAndOnly(t *testing.T) {
 	}
 	if len(f2.lists) != 1 || f2.lists[0] != "Rust" {
 		t.Errorf("-only applied the wrong categories: %v", f2.lists)
+	}
+}
+
+// The limit has to hold when a batch is larger than it: the counters it is
+// checked against only advance when a batch is written, so a limit smaller
+// than the batch was never reached before everything had been queued.
+func TestApplyRespectsLimitWithBatches(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		limit, batch int
+		dryRun       bool
+		wantFiled    int
+		wantStopped  bool
+	}{
+		{"limit 1 batch 25", 1, 25, false, 1, true},
+		{"limit 2 batch 25", 2, 25, false, 2, true},
+		{"limit 1 batch 25 dry run", 1, 25, true, 1, true},
+		{"limit 2 batch 25 dry run", 2, 25, true, 2, true},
+		{"limit a multiple of the batch", 2, 2, false, 2, true},
+		{"limit above the number of changes", 10, 25, false, 3, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c, p := testSetup(t)
+			var out bytes.Buffer
+			res, err := Apply(context.Background(), c, p, ApplyOptions{
+				Limit: tc.limit, Batch: tc.batch, DryRun: tc.dryRun, Out: &out,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.ReposFiled != tc.wantFiled || res.StoppedAtCap != tc.wantStopped {
+				t.Errorf("filed %d, stopped %v; want %d, %v", res.ReposFiled, res.StoppedAtCap, tc.wantFiled, tc.wantStopped)
+			}
+			wrote := 0
+			for _, ids := range f.member {
+				if len(ids) > 0 {
+					wrote++
+				}
+			}
+			if tc.dryRun {
+				if wrote != 0 {
+					t.Errorf("dry run wrote %d repositories", wrote)
+				}
+				if n := strings.Count(out.String(), "would file"); n != tc.wantFiled {
+					t.Errorf("dry run reported %d repositories, want %d:\n%s", n, tc.wantFiled, out.String())
+				}
+				return
+			}
+			if wrote != tc.wantFiled {
+				t.Errorf("wrote %d repositories, want %d", wrote, tc.wantFiled)
+			}
+			if n := strings.Count(out.String(), " + "); n != tc.wantFiled {
+				t.Errorf("reported %d repositories, want %d:\n%s", n, tc.wantFiled, out.String())
+			}
+		})
+	}
+}
+
+// The final partial batch must go out exactly once when the limit is hit.
+func TestApplyLimitFlushesOnce(t *testing.T) {
+	f, c, p := testSetup(t)
+	res, err := Apply(context.Background(), c, p, ApplyOptions{Limit: 2, Batch: 2, Out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two list creations, then a single membership request carrying both.
+	if f.posts != 3 || res.ReposFiled != 2 || !res.StoppedAtCap {
+		t.Errorf("posts %d, filed %d, stopped %v; want 3, 2, true", f.posts, res.ReposFiled, res.StoppedAtCap)
 	}
 }
 
