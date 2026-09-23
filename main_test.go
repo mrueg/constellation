@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -485,6 +486,103 @@ func TestUnreadableReadmesAreCached(t *testing.T) {
 	cache := gh.ReadmeCache{}
 	if changed := harvestReadmes(cache, repos, time.Now()); changed != 2 {
 		t.Errorf("harvested %d entries, want both failures recorded", changed)
+	}
+}
+
+// countingStars stands in for GitHub and records which kind of read each run
+// made: a full walk, or a top-up of the cached tail.
+type countingStars struct {
+	full, topUps int
+}
+
+func (c *countingStars) Starred(context.Context) ([]gh.Repo, error) {
+	c.full++
+	return []gh.Repo{{ID: 1, FullName: "a/one"}, {ID: 2, FullName: "b/two"}}, nil
+}
+
+func (c *countingStars) StarredIncremental(_ context.Context, cached []gh.Repo) ([]gh.Repo, bool, error) {
+	c.topUps++
+	return cached, true, nil
+}
+
+// ageStarCache moves every timestamp in the star cache back by d, which is
+// what the file would look like had d passed since it was written: the only
+// way to run the tool "tomorrow" without waiting for it.
+func ageStarCache(t *testing.T, path string, d time.Duration) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file map[string]json.RawMessage
+	if err := json.Unmarshal(b, &file); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"fetched_at", "full_fetched_at"} {
+		raw, ok := file[key]
+		if !ok {
+			continue
+		}
+		var at time.Time
+		if err := json.Unmarshal(raw, &at); err != nil {
+			t.Fatal(err)
+		}
+		if file[key], err = json.Marshal(at.Add(-d)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if b, err = json.Marshal(file); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A top-up never revisits the repositories already cached, so
+// --cache-full-ttl promises a full re-read once in a while for the
+// descriptions and topics edited upstream. Measuring that age from the last
+// write, which every top-up refreshes, meant that running the tool daily
+// kept the full re-read forever a month away.
+func TestDailyTopUpsStillReachTheFullReRead(t *testing.T) {
+	const day = 24 * time.Hour
+	f := &planFlags{
+		cachePath:    filepath.Join(t.TempDir(), "stars.json"),
+		cacheMaxAge:  day,
+		cacheFullAge: 30 * day,
+	}
+	src := &countingStars{}
+
+	// Day 0: nothing cached, so the list is read in full.
+	if _, err := loadStars(context.Background(), src, "octocat", f); err != nil {
+		t.Fatal(err)
+	}
+	if src.full != 1 || src.topUps != 0 {
+		t.Fatalf("first run made %d full reads and %d top-ups, want 1 and 0", src.full, src.topUps)
+	}
+
+	var fullOn int
+	for d := 1; d <= 31; d++ {
+		ageStarCache(t, f.cachePath, day)
+		before := src.full
+		if _, err := loadStars(context.Background(), src, "octocat", f); err != nil {
+			t.Fatalf("day %d: %v", d, err)
+		}
+		if src.full > before {
+			if fullOn != 0 {
+				t.Fatalf("day %d: a second full read, after one on day %d", d, fullOn)
+			}
+			fullOn = d
+		}
+	}
+	if fullOn == 0 {
+		t.Fatalf("31 daily runs made %d top-ups and never re-read the list in full; --cache-full-ttl is 30 days", src.topUps)
+	}
+	if fullOn < 30 {
+		t.Errorf("the full re-read came on day %d, before --cache-full-ttl had passed", fullOn)
+	}
+	if src.topUps != 30 {
+		t.Errorf("%d top-ups over 31 days, want 30: every run but the full re-read", src.topUps)
 	}
 }
 
