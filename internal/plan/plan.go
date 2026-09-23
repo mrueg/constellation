@@ -29,6 +29,16 @@ type Plan struct {
 	// self-describing: the categories depend on a dozen weights and
 	// thresholds, and without them a plan cannot be reproduced or explained
 	// months later except by remembering the command line.
+	//
+	// Keys are the flag names of the run that built the categories. An
+	// incremental run does not rebuild them, so it carries these forward
+	// unchanged from the plan it extended — whatever clustering flags were on
+	// its own command line — and records itself separately:
+	// "incremental" is "true", "incremental-from" is the GeneratedAt of the
+	// plan extended, in RFC 3339, and the "place-" keys
+	// (place-min-similarity, place-outlier-sigmas, place-multi-list,
+	// place-multi-list-ratio) are the placement knobs the newcomers were
+	// filed with. Only the latest pass is recorded: each one overwrites them.
 	Settings   map[string]string `json:"settings,omitempty"`
 	TotalStars int               `json:"total_stars"`
 	Categories []Category        `json:"categories"`

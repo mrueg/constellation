@@ -690,3 +690,130 @@ func TestExtendPlanRefusesAnotherAccountsPlan(t *testing.T) {
 		t.Error("extending a plan made for another account was allowed")
 	}
 }
+
+// Every flag either changes the plan and is recorded in its settings, or does
+// not and is named here as such. A flag in neither place is the bug this test
+// exists to catch: a plan that cannot say what produced it.
+func TestSettingsRecordEveryFlag(t *testing.T) {
+	// Where the data comes from and where the plan goes, not what it says.
+	unrecorded := map[string]string{
+		"out":              "output path",
+		"markdown":         "output path",
+		"token":            "credential",
+		"readme-workers":   "concurrency",
+		"cache":            "cache path",
+		"cache-ttl":        "cache freshness",
+		"cache-full-ttl":   "cache freshness",
+		"refresh":          "cache bypass",
+		"readme-cache":     "cache path",
+		"readme-cache-ttl": "cache freshness",
+		"refresh-readmes":  "cache bypass",
+		"stale-after":      "reports only; nothing is filtered",
+		"verbose":          "terminal output",
+		"show":             "terminal output",
+		"incremental":      "recorded by extendPlan, not settings",
+		"apply":            "what happens after the plan is written",
+	}
+	f := defaultPlanFlags(t)
+	settings := f.settings()
+	seen := map[string]bool{}
+	for _, flag := range f.flags() {
+		name := flag.Names()[0]
+		seen[name] = true
+		_, recorded := settings[name]
+		_, listed := unrecorded[name]
+		switch {
+		case recorded && listed:
+			t.Errorf("--%s is recorded in the settings but listed as not affecting the plan", name)
+		case !recorded && !listed:
+			t.Errorf("--%s is not recorded in the plan's settings; add it to settings(), or to this test's list if it cannot change the plan", name)
+		}
+	}
+	for name := range unrecorded {
+		if !seen[name] {
+			t.Errorf("this test lists a --%s flag that no longer exists", name)
+		}
+	}
+	for key := range settings {
+		if !seen[key] {
+			t.Errorf("settings() records %q, which is not a flag", key)
+		}
+	}
+}
+
+// Two plans built from different text must not record the same settings.
+func TestSettingsRecordReadme(t *testing.T) {
+	with := defaultPlanFlags(t)
+	without := defaultPlanFlags(t)
+	without.withReadme = false
+	if reflect.DeepEqual(with.settings(), without.settings()) {
+		t.Fatal("--readme=false and the default record identical settings")
+	}
+	if got := without.settings()["readme"]; got != "false" {
+		t.Errorf("readme recorded as %q, want false", got)
+	}
+}
+
+// An incremental run keeps the categories a previous run produced, so it must
+// keep the settings that produced them too: the clustering flags on its own
+// command line did nothing, and recording them would describe a plan that was
+// never built. The pass itself is recorded separately, with the placement
+// knobs that did apply.
+func TestExtendPlanKeepsTheSettingsThatBuiltTheCategories(t *testing.T) {
+	built := defaultPlanFlags(t)
+	first, err := buildPlan(context.Background(), nil, "octocat", synthRepos(60), built)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Stamp(time.Date(2026, 9, 1, 8, 30, 0, 0, time.UTC))
+
+	extended := defaultPlanFlags(t)
+	extended.algorithm = "kmeans"
+	extended.maxK = 5
+	extended.minCohesion = 0.9
+	extended.seed = 42
+	extended.minSimilarity = 0.11
+	extended.outlierSigmas = 0
+	extended.multiList = 2
+	extended.multiRatio = 0.5
+	second, err := extendPlan(context.Background(), nil, "octocat", synthRepos(66), extended, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for key, want := range first.Settings {
+		if got := second.Settings[key]; got != want {
+			t.Errorf("settings[%q] = %q after the incremental run, want %q from the run that built the categories", key, got, want)
+		}
+	}
+	if first.Settings["algorithm"] != "agglomerative" || second.Settings["algorithm"] == "kmeans" {
+		t.Errorf("the incremental run's --algorithm kmeans was recorded over the previous run's %q", first.Settings["algorithm"])
+	}
+	want := map[string]string{
+		"incremental":            "true",
+		"incremental-from":       "2026-09-01T08:30:00Z",
+		"place-min-similarity":   "0.11",
+		"place-outlier-sigmas":   "0",
+		"place-multi-list":       "2",
+		"place-multi-list-ratio": "0.5",
+	}
+	for key, v := range want {
+		if got := second.Settings[key]; got != v {
+			t.Errorf("settings[%q] = %q, want %q", key, got, v)
+		}
+	}
+	if _, ok := first.Settings["incremental"]; ok {
+		t.Error("the previous plan was marked incremental in place; the settings must be copied, not shared")
+	}
+
+	// A plan written before settings were recorded has nothing to carry
+	// forward, and extending it must still record the pass.
+	first.Settings = nil
+	third, err := extendPlan(context.Background(), nil, "octocat", synthRepos(66), extended, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Settings["incremental"] != "true" {
+		t.Error("extending a plan without settings did not record the incremental pass")
+	}
+}
