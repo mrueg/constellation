@@ -3,6 +3,7 @@
 package textproc
 
 import (
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -97,7 +98,9 @@ library libraries lib package packages module modules project projects repo repo
 tool tools toolkit simple easy fast small tiny lightweight modern minimal awesome list collection
 curated based written using use used uses using support supports supported implementation code
 source open free new go golang js javascript version like also via etc example examples demo
-best great powerful flexible full complete unofficial official yet another cross platform`
+best great powerful flexible full complete unofficial official yet another cross platform
+https www com io img png badge badges shields readme install installation usage license licence
+mit apache contributing changelog`
 	set := make(map[string]bool)
 	for _, w := range strings.Fields(list) {
 		set[w] = true
@@ -107,9 +110,14 @@ best great powerful flexible full complete unofficial official yet another cross
 
 // aliases collapse the many spellings of the same ecosystem onto one term so
 // that "k8s" and "kubernetes" repos land in the same cluster.
+//
+// Every entry is applied to prose as well as to topics, so an alias has to be
+// unambiguous in a sentence. "cd", "obs", "dl" and "crypto" were not: a README
+// saying "cd into the directory" was filed under CI/CD, and "dl the file"
+// under deep learning.
 var aliases = map[string]string{
 	"k8s": "kubernetes", "kube": "kubernetes", "kubectl": "kubernetes",
-	"ml": "machinelearning", "ai": "artificialintelligence", "dl": "deeplearning",
+	"ml": "machinelearning", "ai": "artificialintelligence",
 	"llm": "llm", "llms": "llm", "genai": "generativeai",
 	// These name a language unambiguously wherever they appear — most often as
 	// a repository topic — so they join the term the Language field produces
@@ -123,14 +131,16 @@ var aliases = map[string]string{
 	"k3s": "kubernetes", "oci": "container", "docker": "container",
 	"containers": "container", "containerd": "container",
 	"cli": "commandline", "tui": "terminal", "cmdline": "commandline",
-	"ci": "cicd", "cd": "cicd", "devops": "cicd",
+	"ci": "cicd", "devops": "cicd",
 	"db": "database", "sql": "database", "dbs": "database",
 	"sec": "security", "infosec": "security", "appsec": "security",
-	"k6": "loadtesting", "obs": "observability", "otel": "opentelemetry",
+	"k6": "loadtesting", "otel": "opentelemetry",
 	"prom": "prometheus", "graf": "grafana",
-	"nvim": "neovim", "vim": "neovim",
-	"web3": "blockchain", "crypto": "cryptography",
-	"gh": "github", "gitops": "gitops",
+	// Vim and Neovim plugins are one ecosystem, and the shorter name is the
+	// one a reader expects on a list called after it.
+	"nvim": "vim", "neovim": "vim",
+	"web3": "blockchain",
+	"gh":   "github", "gitops": "gitops",
 }
 
 // Pretty renders a canonical term back into something a human wants to read on
@@ -146,14 +156,14 @@ var Pretty = map[string]string{
 	"aws": "AWS", "gcp": "GCP", "css": "CSS", "html": "HTML", "json": "JSON",
 	"yaml": "YAML", "wasm": "WebAssembly", "ebpf": "eBPF", "gpu": "GPU",
 	"os": "OS", "rss": "RSS", "vpn": "VPN", "ssh": "SSH", "ui": "UI", "ux": "UX",
-	"neovim": "Neovim", "nixos": "NixOS", "macos": "macOS", "ios": "iOS",
+	"vim": "Vim", "neovim": "Neovim", "nixos": "NixOS", "macos": "macOS", "ios": "iOS",
 	"imap": "IMAP", "smtp": "SMTP", "jmap": "JMAP", "pop3": "POP3", "mta": "MTA",
 	"csv": "CSV", "xml": "XML", "ntp": "NTP", "smb": "SMB", "nfs": "NFS",
 	"esp32": "ESP32", "esp8266": "ESP8266", "rfc": "RFC", "pdf": "PDF", "svg": "SVG",
 	"oidc": "OIDC", "saml": "SAML", "ldap": "LDAP", "mqtt": "MQTT", "cve": "CVE",
 	"sbom": "SBOM", "tui": "TUI", "ide": "IDE", "vm": "VM", "cpu": "CPU",
 	"github": "GitHub", "gitlab": "GitLab", "gitops": "GitOps", "devsecops": "DevSecOps",
-	"nodejs": "Node.js", "dotnet": ".NET", "cpp": "C++", "csharp": "C#",
+	"nodejs": "Node.js", "dotnet": ".NET", "cpp": "C++", "csharp": "C#", "fsharp": "F#",
 	LangPrefix + "go": "Go", LangPrefix + "cpp": "C++", LangPrefix + "csharp": "C#",
 	LangPrefix + "fsharp": "F#", LangPrefix + "c": "C", LangPrefix + "objectivec": "Objective-C",
 	LangPrefix + "javascript": "JavaScript", LangPrefix + "typescript": "TypeScript",
@@ -232,15 +242,67 @@ func NewTopicIndex(topicLists [][]string, minCount int) TopicIndex {
 	return TopicIndex(best)
 }
 
+// spelled rewrites the names whose punctuation is the whole point, before the
+// splitter throws it away: "C++" and "C#" would both come out as "c", ".NET"
+// as "net" and "Node.js" as "node". Each is matched case-insensitively and
+// only as a whole word, so "libc++" and "asp.netcore" are left alone. The
+// Language field and prose share the table so that a description saying
+// "C++ library" and a repository detected as C++ agree on the spelling.
+var spelled = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`(?i)\bc\+\+(\W|$)`), "cpp$1"},
+	{regexp.MustCompile(`(?i)\bc#(\W|$)`), "csharp$1"},
+	{regexp.MustCompile(`(?i)\bf#(\W|$)`), "fsharp$1"},
+	{regexp.MustCompile(`(?i)(^|\W)\.net\b`), "${1}dotnet"},
+	{regexp.MustCompile(`(?i)\bnode\.js\b`), "nodejs"},
+}
+
+// spell applies the spelled table. The guard is only there to skip five
+// regular expressions on the vast majority of strings that cannot match.
+func spell(s string) string {
+	if !strings.ContainsAny(s, "+#.") {
+		return s
+	}
+	for _, p := range spelled {
+		s = p.re.ReplaceAllString(s, p.repl)
+	}
+	return s
+}
+
+// Markup that reaches the tokenizer. READMEs are stripped of it when fetched,
+// but descriptions are not, and READMEs cached before that stripping existed
+// still carry it — so the tokenizer strips it again rather than trust its
+// callers. A badge line contributes "https", "img", "shields", "io", "badge"
+// and "svg", which are shared by thousands of unrelated repositories and would
+// happily group them.
+var (
+	mdImage = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
+	mdLink  = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+	htmlTag = regexp.MustCompile(`(?s)<[a-zA-Z/!][^>]*>`)
+	urlLike = regexp.MustCompile(`\S+://\S+|\bwww\.\S+`)
+)
+
+// clean removes markup and URLs and rewrites punctuated names, leaving a
+// string the splitter can be trusted with.
+func clean(s string) string {
+	if strings.ContainsAny(s, "[<:.") {
+		s = mdImage.ReplaceAllString(s, " ")
+		s = mdLink.ReplaceAllString(s, " $1 ")
+		s = htmlTag.ReplaceAllString(s, " ")
+		s = urlLike.ReplaceAllString(s, " ")
+	}
+	return spell(s)
+}
+
 // Language turns a GitHub language name into its namespaced term. The slug has
 // to keep C, C++ and C# apart, which stripping punctuation would not.
 func Language(name string) string {
-	name = strings.ToLower(strings.TrimSpace(name))
+	name = spell(strings.ToLower(strings.TrimSpace(name)))
 	if name == "" {
 		return ""
 	}
-	name = strings.ReplaceAll(name, "++", "pp")
-	name = strings.ReplaceAll(name, "#", "sharp")
 	var b strings.Builder
 	for _, r := range name {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
@@ -279,7 +341,7 @@ func Tokenize(s string) []string {
 
 func tokenize(s string) []token {
 	var out []token
-	for _, chunk := range strings.FieldsFunc(s, func(r rune) bool {
+	for _, chunk := range strings.FieldsFunc(clean(s), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
 		// A known term is kept whole. Splitting on case would otherwise turn

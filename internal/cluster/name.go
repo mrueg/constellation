@@ -292,9 +292,6 @@ func composeName(terms []string, scores []float64, used map[string]bool) string 
 	return name
 }
 
-// redundant reports whether p repeats something already in the name, which is
-// common once phrases are in play: "Kubernetes" and "Kubernetes Operator"
-// should not both appear.
 // phraseAround returns a candidate phrase that contains the leading term, if
 // one scores well enough to be worth preferring over it.
 func phraseAround(terms []string, scores []float64) string {
@@ -312,15 +309,21 @@ func phraseAround(terms []string, scores []float64) string {
 	return ""
 }
 
+// redundant reports whether p repeats something already in the name, which is
+// common once phrases are in play: "Kubernetes" and "Kubernetes Operator"
+// should not both appear.
+//
+// The comparison is between whole words. Substring matching made "Django"
+// redundant with "Go", "Trust" with "Rust" and "Rapid" with "API", so a
+// cluster that was really about both Go and Django was called just "Go".
 func redundant(parts []string, p string) bool {
-	lp := strings.ToLower(p)
+	words := map[string]bool{}
+	for _, w := range strings.Fields(strings.ToLower(p)) {
+		words[w] = true
+	}
 	for _, e := range parts {
-		le := strings.ToLower(e)
-		if strings.Contains(le, lp) || strings.Contains(lp, le) {
-			return true
-		}
-		for _, w := range strings.Fields(lp) {
-			if strings.Contains(le, w) {
+		for _, w := range strings.Fields(strings.ToLower(e)) {
+			if words[w] {
 				return true
 			}
 		}
