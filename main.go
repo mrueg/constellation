@@ -266,14 +266,14 @@ func (f *planFlags) flags() []cli.Flag {
 		&cli.IntFlag{Name: "lsa-oversample", Usage: "extra columns in the random sketch; 0 scales it with --lsa-dims. Too few leaves the tail of the factorization under-converged, which shows up as the answer depending on --lsa-seed", Destination: &f.lsaOversample},
 		&cli.IntFlag{Name: "lsa-power", Value: 4, Usage: "power iterations for the randomized SVD; more is slower and sharper", Destination: &f.lsaPower},
 		&cli.BoolFlag{Name: "readme", Value: true, Usage: "read each repository's README as well as its description; --readme=false to skip", Destination: &f.withReadme},
-		&cli.IntFlag{Name: "readme-bytes", Value: 8192, Usage: "how much of each README to fetch", Destination: &f.readmeBytes},
+		&cli.IntFlag{Name: "readme-bytes", Value: 8192, Usage: "cap on the prose kept from each README, in bytes, applied after markup is stripped and the opening chosen; 0 for no cap", Destination: &f.readmeBytes},
 		&cli.Float64Flag{Name: "topic-weight", Value: textproc.WeightTopic, Usage: "how much a repository topic counts, kept whole; 0 falls back to splitting it into words", Destination: &f.topicWeight},
 		&cli.Float64Flag{Name: "topic-word-weight", Value: textproc.WeightTopicWord, Usage: "how much each word of a multi-word topic counts on its own", Destination: &f.topicWordW},
 		&cli.Float64Flag{Name: "topic-inferred-weight", Value: 0.5, Usage: "scales how much topics recognized in an untagged repository's name, description and README opening count, relative to each other; 0 disables the inference", Destination: &f.topicInferred},
 		&cli.IntFlag{Name: "topic-min-count", Value: 3, Usage: "how often a topic must be used in your stars before it can be inferred from a description", Destination: &f.topicMinCount},
 		&cli.Float64Flag{Name: "language-weight", Value: textproc.WeightLanguage, Usage: "how much a repository's programming language counts; every repository in a language shares this exact term, so it groups strongly", Destination: &f.langWeight},
 		&cli.Float64Flag{Name: "readme-weight", Value: textproc.WeightReadme, Usage: "how much each README term counts, against 3 for a topic and 1 for a description word", Destination: &f.readmeWeight},
-		&cli.IntFlag{Name: "readme-words", Value: 120, Usage: "words of README prose to keep; the opening is a project's own summary, the rest is installation notes", Destination: &f.readmeWords},
+		&cli.IntFlag{Name: "readme-words", Value: 120, Usage: "words of the README's opening summary to keep: its title, tagline and first descriptive paragraphs, skipping installation, usage, licensing and similar sections; 0 keeps the whole opening", Destination: &f.readmeWords},
 		&cli.IntFlag{Name: "readme-workers", Value: 8, Usage: "concurrent README fetches", Destination: &f.readmeWorker},
 
 		&cli.IntFlag{Name: "multi-list", Value: 1, Usage: "most lists one repository may join; 1 keeps each repository in a single list", Destination: &f.multiList},
@@ -468,9 +468,11 @@ func embedRepos(ctx context.Context, repos []gh.Repo, f *planFlags) ([]embed.Doc
 	for i, r := range repos {
 		// --readme=false has to exclude the text as well as the fetch, or a
 		// cached README from an earlier run silently stays in the model.
-		// Truncation is applied here rather than only at fetch time, so that
-		// changing --readme-words takes effect against an existing cache
-		// instead of silently doing nothing.
+		// The word cut is applied here as well as at fetch time, so that
+		// lowering --readme-words takes effect against an existing cache
+		// instead of silently doing nothing. Raising it cannot: the cache
+		// holds only the opening that was kept, so that needs
+		// --refresh-readmes.
 		readme := ""
 		if f.withReadme {
 			readme = firstWords(r.Readme, f.readmeWords)
@@ -1009,7 +1011,7 @@ func reportStale(repos []gh.Repo, before time.Time, w io.Writer) int {
 // rather than the concrete client means the tests can supply a stand-in
 // without the package exporting a constructor that exists only for them.
 type readmeFetcher interface {
-	Readme(ctx context.Context, owner, repo string, limit int) (string, error)
+	Readme(ctx context.Context, owner, repo string, limits gh.ReadmeLimits) (string, error)
 }
 
 func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *planFlags) int {
@@ -1052,7 +1054,7 @@ func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *plan
 				if stopped() {
 					continue
 				}
-				text, err := c.Readme(ctx, repos[i].Owner(), repos[i].Name(), f.readmeBytes)
+				text, err := c.Readme(ctx, repos[i].Owner(), repos[i].Name(), gh.ReadmeLimits{Words: f.readmeWords, Bytes: f.readmeBytes})
 				if err != nil {
 					mu.Lock()
 					switch {
@@ -1082,8 +1084,10 @@ func fetchReadmes(ctx context.Context, c readmeFetcher, repos []gh.Repo, f *plan
 					continue
 				}
 				// An empty README is a real answer, and marking it stops the
-				// next run asking again.
-				readme := firstWords(text, f.readmeWords)
+				// next run asking again. The text is already the opening
+				// within --readme-words: the cache stores exactly what the
+				// client kept.
+				readme := text
 				if readme == "" {
 					readme = " "
 				}
@@ -1184,7 +1188,9 @@ func harvestReadmes(c gh.ReadmeCache, repos []gh.Repo, now time.Time) int {
 	return changed
 }
 
-// firstWords keeps the opening n words of a text.
+// firstWords keeps the opening n words of a text. The client already keeps
+// only the README's opening; this is the cap that lets a lower --readme-words
+// apply to cached text without a re-fetch.
 func firstWords(s string, n int) string {
 	if n <= 0 {
 		return s

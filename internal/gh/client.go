@@ -262,15 +262,33 @@ func (c *Client) StarredIncremental(ctx context.Context, cached []Repo) ([]Repo,
 	return merged, true, nil
 }
 
-// Readme fetches the repository's README as plain text, truncated to limit
-// bytes. A missing README is not an error; some repositories have none.
+// ReadmeLimits bounds what Readme keeps of a README.
+type ReadmeLimits struct {
+	// Words is how many words of the opening to keep; zero or less keeps
+	// the whole opening.
+	Words int
+	// Bytes caps the text kept, after the markup is stripped and the opening
+	// chosen; zero or less is no cap. A safety net for the word cut, which
+	// a language written without spaces can walk straight past.
+	Bytes int
+}
+
+// Readme fetches the repository's README and reduces it to the opening that
+// describes the project — its title, tagline and first descriptive
+// paragraphs, with badges, code, links and the sections every project has
+// stripped out — within limits. A missing README is not an error; some
+// repositories have none.
+//
+// The whole file is read and reduced before anything is cut. A README that
+// opens with a screen of badges and a table of contents has its prose further
+// in than any byte budget reaches, so cutting first left nothing to read.
 //
 // A README that exists but cannot be served — too large for the API, blocked,
 // taken down — comes back wrapped in ErrReadmeUnavailable, which is the
 // caller's cue that asking again later will not help. Any other error may be
 // the connection, the token or the rate limit, and says nothing about the
 // README itself.
-func (c *Client) Readme(ctx context.Context, owner, repo string, limit int) (string, error) {
+func (c *Client) Readme(ctx context.Context, owner, repo string, limits ReadmeLimits) (string, error) {
 	var content string
 	err := c.retry(ctx, func() error {
 		rc, _, err := c.api.Repositories.GetReadme(ctx, owner, repo, nil)
@@ -295,10 +313,7 @@ func (c *Client) Readme(ctx context.Context, owner, repo string, limit int) (str
 		}
 		return "", err
 	}
-	if len(content) > limit {
-		content = content[:limit]
-	}
-	return stripMarkdown(content), nil
+	return capBytes(readmeOpening(content, limits.Words), limits.Bytes), nil
 }
 
 // retry waits out rate limits rather than failing a long fetch halfway
