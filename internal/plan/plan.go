@@ -58,8 +58,8 @@ type Repo struct {
 	Description string    `json:"description,omitempty"`
 	Similarity  float64   `json:"similarity"`
 	Stars       int       `json:"stars,omitempty"`
-	PushedAt    time.Time `json:"pushed_at,omitempty"`
-	StarredAt   time.Time `json:"starred_at,omitempty"`
+	PushedAt    time.Time `json:"pushed_at,omitzero"`
+	StarredAt   time.Time `json:"starred_at,omitzero"`
 }
 
 // entry copies the parts of a repository the plan keeps.

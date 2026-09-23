@@ -365,6 +365,34 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+// omitempty never omits a struct, so a repository whose dates were never
+// fetched used to be written with the year-one zero time. omitzero drops it.
+func TestZeroTimestampsAreOmitted(t *testing.T) {
+	zero, err := json.Marshal(Repo{FullName: "a/b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"pushed_at", "starred_at"} {
+		if strings.Contains(string(zero), key) {
+			t.Errorf("zero %s was written: %s", key, zero)
+		}
+	}
+	if strings.Contains(string(zero), "0001-01-01") {
+		t.Errorf("zero time leaked into the plan: %s", zero)
+	}
+
+	stamped := time.Date(2024, 3, 4, 5, 6, 7, 0, time.UTC)
+	set, err := json.Marshal(Repo{FullName: "a/b", PushedAt: stamped, StarredAt: stamped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"pushed_at", "starred_at"} {
+		if !strings.Contains(string(set), `"`+key+`":"2024-03-04T05:06:07Z"`) {
+			t.Errorf("%s missing from %s", key, set)
+		}
+	}
+}
+
 func TestLoadRejectsAnIncompatiblePlan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "plan.json")
 	if err := writeFile(path, `{"version":99}`); err != nil {
