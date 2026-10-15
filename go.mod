@@ -8,8 +8,8 @@ require (
 	github.com/google/go-github/v90 v90.0.0
 	github.com/kljensen/snowball v0.10.0
 	github.com/mattn/go-isatty v0.0.24
-	github.com/mattn/go-runewidth v0.0.30
-	github.com/urfave/cli/v3 v3.12.0
+	github.com/mattn/go-runewidth v0.0.31
+	github.com/urfave/cli/v3 v3.14.0
 	gonum.org/v1/gonum v0.17.0
 )
 
