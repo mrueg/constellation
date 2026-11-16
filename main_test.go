@@ -563,7 +563,11 @@ func TestDailyTopUpsStillReachTheFullReRead(t *testing.T) {
 
 	var fullOn int
 	for d := 1; d <= 31; d++ {
-		ageStarCache(t, f.cachePath, day)
+		// A run lands a little more than a day after the last one. Ageing by
+		// exactly a day leaves the cache exactly --cache-ttl old wherever the
+		// clock is too coarse to see the test's own runtime (Windows), and
+		// "not older than the TTL" means no top-up.
+		ageStarCache(t, f.cachePath, day+time.Minute)
 		before := src.full
 		if _, err := loadStars(context.Background(), src, "octocat", f); err != nil {
 			t.Fatalf("day %d: %v", d, err)
