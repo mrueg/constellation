@@ -2,6 +2,8 @@ module github.com/mrueg/constellation
 
 go 1.27
 
+toolchain go1.27.4
+
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/fatih/color v1.19.0
